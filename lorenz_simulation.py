@@ -1,7 +1,6 @@
 """Stochastically driven Lorenz simulator.
 
-Generates the dataset analyzed in Fig 2 of Kaur, Jain, and Berman (PRX
-Life, 2026).  The Lorenz `sigma` parameter is logistically modulated by a
+Generates the dataset analyzed in Fig 2 of Kaur, Jain, and Berman (2026).  The Lorenz `sigma` parameter is logistically modulated by a
 slow hidden driver `h(t)`, which is itself sampled by Metropolis dynamics in
 a symmetric double-well potential U(h) = h^4 - 8 h^2.  The two minima at
 h = +-2 correspond to two metastable wings of the Lorenz attractor; the
