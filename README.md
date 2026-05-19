@@ -3,7 +3,7 @@
 This directory contains the supplementary code accompanying
 
 > Kaur, Jain, & Berman, *Extracting long-timescale structure from
-> non-stationary biological dynamics*, **PRX Life (2026)**.
+> non-stationary biological dynamics (2026).
 
 The repository has two layers:
 
@@ -238,7 +238,7 @@ notebooks entirely.
 
 ## Per-notebook runtime estimates
 
-Rough estimates on a 2024 laptop without a GPU.
+Rough estimates on a 2024 MacBook Pro without a GPU.
 
 | Workflow | Time |
 |----------|------|
@@ -260,7 +260,7 @@ If this code is useful in your work, please cite the manuscript:
   title   = {Extracting long-timescale structure from non-stationary
              biological dynamics},
   author  = {Kaur, P. and Jain, K. and Berman, G. J.},
-  journal = {PRX Life},
+  journal = {arXiv},
   year    = {2026},
 }
 ```
