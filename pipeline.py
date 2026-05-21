@@ -103,12 +103,14 @@ def _wavelet_one_channel(x, f, dt, omega0):
 
 
 # ---------------------------------------------------------------------------
-# PCA on wavelet amplitudes with a phase-shuffle threshold (Methods Sec.
+# PCA on wavelet amplitudes with a temporal-shuffle threshold (Methods Sec.
 # "PCA on wavelet amplitudes").  We keep the leading components whose
-# eigenvalues exceed the average of the leading eigenvalue across phase-
-# shuffled copies of the wavelet matrix.
+# eigenvalues exceed the average of the leading eigenvalue across
+# temporally-shuffled copies of the wavelet matrix (each feature permuted
+# independently in time -- not a phase randomization).
 # ---------------------------------------------------------------------------
-def pca_with_shuffle_threshold(amplitudes, n_shuffles=10, max_keep=50, seed=0):
+def pca_with_shuffle_threshold(amplitudes, n_shuffles=10, max_keep=50, seed=0,
+                               percentile=None):
     """PCA with shuffle-based component selection.
 
     Parameters
@@ -117,9 +119,14 @@ def pca_with_shuffle_threshold(amplitudes, n_shuffles=10, max_keep=50, seed=0):
         Wavelet amplitudes from morlet_wavelet_amplitudes (or any non-negative
         spectrogram-like matrix).
     n_shuffles : int
-        Number of independent phase-shuffles for the threshold estimate.
+        Number of independent temporal shuffles for the threshold estimate.
     max_keep : int
         Maximum number of components to keep regardless of threshold.
+    percentile : float or None
+        How to reduce the `n_shuffles` shuffled leading-eigenvalues to a single
+        threshold.  None (default) uses their mean (the manuscript recipe); a
+        value in (0, 100] uses that percentile instead -- e.g. 95 is more
+        conservative (keeps fewer PCs), 50 is the median.
 
     Returns
     -------
@@ -141,14 +148,19 @@ def pca_with_shuffle_threshold(amplitudes, n_shuffles=10, max_keep=50, seed=0):
     # Threshold: mean of lambda_1 across phase-shuffled wavelet matrices.
     shuf_lambdas = np.zeros(n_shuffles)
     for s in range(n_shuffles):
-        # Phase-shuffle each column independently (preserves marginal).
+        # Shuffle each column independently across time: preserves each
+        # feature's marginal while destroying temporal and cross-feature
+        # structure (a plain permutation, not a phase randomization).
         Ash = A.copy()
         for j in range(Ash.shape[1]):
             Ash[:, j] = rng.permutation(Ash[:, j])
         pca_sh = PCA(n_components=1)
         pca_sh.fit(Ash)
         shuf_lambdas[s] = pca_sh.explained_variance_[0]
-    threshold = float(shuf_lambdas.mean())
+    if percentile is None:
+        threshold = float(shuf_lambdas.mean())
+    else:
+        threshold = float(np.percentile(shuf_lambdas, percentile))
     n_kept = int(np.sum(eigvals > threshold))
     projections = pca.transform(A)[:, :n_kept]
     return projections, n_kept, eigvals, threshold
@@ -263,15 +275,16 @@ def kmeans_partition(X, N, batch_size=None, n_init=20, seed=None,
 # that of a Shannon-shuffled surrogate; the optimal N maximises the gap.
 # ---------------------------------------------------------------------------
 def markov_entropy(states, lag, framerate=1.0):
-    """Shannon entropy rate (bits / time-unit) of the lag-tau Markov model
-    estimated from a single sequence."""
+    """Shannon entropy rate (nats / time-unit) of the lag-tau Markov model
+    estimated from a single sequence.  (Natural log, matching the entropy-gap
+    figures, which are labelled in nats.)"""
     T = make_transition_matrix(states, lag)
     pi = stationary_distribution(T)
     h = 0.0
     for i in range(T.shape[0]):
         for j in range(T.shape[1]):
             if T[i, j] > 0:
-                h -= pi[i] * T[i, j] * np.log2(T[i, j])
+                h -= pi[i] * T[i, j] * np.log(T[i, j])
     return h * framerate
 
 
@@ -323,14 +336,30 @@ def make_transition_matrix(states, lag, n_states=None):
     """Row-stochastic transition matrix at the given lag.
 
     The element T[i, j] is the empirical probability of being in state j at
-    time t + lag conditional on being in state i at time t.  Rows that never
-    appear are set to a uniform distribution to keep T well-defined.
+    time t + lag conditional on being in state i at time t.
+
+    `states` may be a single 1-D integer sequence, OR a list/tuple of
+    per-individual sequences.  When a list is given, transitions are counted
+    *within* each sequence only and never across the boundary between
+    individuals (or recording segments) -- pooling with ``np.concatenate``
+    instead would inject ``lag`` spurious splice transitions per boundary, so
+    always pass a list when you have more than one recording.
+
+    Rows for states that never appear are set to a uniform distribution to
+    keep T well-defined (downstream G-PCCA rejects all-zero rows).
     """
-    states = np.asarray(states, dtype=int)
+    if isinstance(states, (list, tuple)):
+        seqs = [np.asarray(s, dtype=int) for s in states]
+    else:
+        seqs = [np.asarray(states, dtype=int)]
     if n_states is None:
-        n_states = int(states.max()) + 1
+        n_states = int(max(int(s.max()) for s in seqs if s.size)) + 1
     a = np.arange(n_states + 1)
-    F, _, _ = np.histogram2d(states[:-lag], states[lag:], bins=[a, a])
+    F = np.zeros((n_states, n_states))
+    for s in seqs:
+        if s.size > lag:
+            Fi, _, _ = np.histogram2d(s[:-lag], s[lag:], bins=[a, a])
+            F += Fi
     sums = F.sum(axis=1, keepdims=True)
     # Empty rows (state never appears as a "from") get a uniform distribution
     # rather than all zeros, so T remains a valid (row-stochastic) transition

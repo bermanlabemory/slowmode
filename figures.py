@@ -236,3 +236,52 @@ def save_panel(fig, name, out_dir='outputs', formats=('png', 'pdf')):
     os.makedirs(out_dir, exist_ok=True)
     for fmt in formats:
         fig.savefig(f'{out_dir}/{name}.{fmt}')
+
+
+# ---------------------------------------------------------------------------
+# Power spectral density, to choose the wavelet frequency band [fmin, fmax]
+# (the one system-specific physical input of the pipeline).
+# ---------------------------------------------------------------------------
+def plot_psd(X, fs, fmin=None, fmax=None, nperseg=None, ax=None, labels=None):
+    """Welch PSD of each channel (log-log), as an aid to picking the wavelet band.
+
+    Manuscript rule of thumb (Methods, "Wavelet decomposition"): set ``fmin``
+    at the frequency where the PSD leaves the broadband noise floor and rises
+    into a clear spectral band, and ``fmax`` where the PSD returns to baseline
+    (or the Nyquist frequency if there is no clear high-frequency rolloff).
+
+    Parameters
+    ----------
+    X : (T,) or (T, n_channels) ndarray   Measurement time series.
+    fs : float                            Sampling rate (Hz).
+    fmin, fmax : float, optional          Candidate band; drawn as dashed lines.
+    nperseg : int, optional               Welch segment length (default min(4096, T)).
+    ax : matplotlib axes, optional        Axes to draw into (created if None).
+    labels : list of str, optional        Per-channel legend labels.
+
+    Returns
+    -------
+    freqs, psd : ndarrays                 Frequencies (Hz) and per-channel PSD.
+    """
+    from scipy.signal import welch
+    X = np.asarray(X, dtype=float)
+    if X.ndim == 1:
+        X = X[:, None]
+    T, n_ch = X.shape
+    if nperseg is None:
+        nperseg = min(4096, T)
+    if ax is None:
+        ax = plt.subplots(figsize=(4.6, 3.0))[1]
+    freqs, P = welch(X, fs=fs, nperseg=nperseg, axis=0)
+    for c in range(n_ch):
+        lab = labels[c] if labels is not None and c < len(labels) else None
+        ax.loglog(freqs[1:], P[1:, c], lw=0.9, alpha=0.75, label=lab)
+    if fmin is not None:
+        ax.axvline(fmin, color='r', ls='--', lw=0.8)
+    if fmax is not None:
+        ax.axvline(fmax, color='r', ls='--', lw=0.8)
+    ax.set_xlabel('frequency (Hz)')
+    ax.set_ylabel('PSD')
+    if labels is not None:
+        ax.legend(fontsize=7, frameon=False)
+    return freqs, P

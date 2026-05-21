@@ -23,8 +23,8 @@ except ImportError:  # pragma: no cover
     GPCCA = None
 
 
-def select_M_spectral_gap(eigvals, M_min=2, M_max=8):
-    """Pick the number of basins by the largest ratio gap.
+def select_M_spectral_gap(eigvals, M_min=2, M_max=8, min_eigval=0.0, warn=True):
+    """Pick the number of basins by the largest ratio gap |lambda_M|/|lambda_{M+1}|.
 
     Parameters
     ----------
@@ -33,22 +33,46 @@ def select_M_spectral_gap(eigvals, M_min=2, M_max=8):
         eigenvalue dropped), ordered by descending magnitude.
     M_min, M_max : int
         Search range for M.
+    min_eigval : float
+        Only consider a gap at M if |lambda_M| >= min_eigval.  The bare
+        largest-ratio rule can latch onto a spurious spike in the flat, noisy
+        tail of the spectrum and return an implausibly large M; a floor (e.g.
+        0.3, or a fraction of |lambda_2|) restricts the choice to slow modes
+        that are actually long-lived.  Default 0.0 reproduces the old behavior.
+    warn : bool
+        If True, emit a warning when the choice is ambiguous -- the top two
+        eligible gap ratios are within 10% of each other -- so you inspect the
+        eigenvalue ladder rather than trusting the arg max.
 
     Returns
     -------
     M : int
-        The M with the largest ratio gap |lambda_M| / |lambda_{M+1}|.
+        The M with the largest (eligible) ratio gap.
     gap : float
-        The corresponding gap ratio (>1 means lambda_M is meaningfully larger
-        than lambda_{M+1}).
+        Its gap ratio (>1 means lambda_M is meaningfully larger than lambda_{M+1}).
     ratios : (M_max - M_min + 1,) ndarray
-        All gap ratios at M = M_min .. M_max.
+        Gap ratios at M = M_min .. M_max (NaN where excluded by `min_eigval`).
     """
-    e = np.abs(np.asarray(eigvals))
-    Ms = np.arange(M_min, min(M_max, len(e) - 1) + 1)
-    ratios = np.array([e[m - 1] / max(e[m], 1e-12) for m in Ms])
-    best = int(Ms[np.argmax(ratios)])
-    return best, float(ratios.max()), ratios
+    import warnings as _warnings
+    e = np.abs(np.asarray(eigvals))     # non-trivial, descending: e[0] = |lambda_2|
+    # Candidate M = number of basins; its gap is |lambda_M|/|lambda_{M+1}|,
+    # which is e[M-2]/e[M-1] once the stationary lambda=1 has been dropped.
+    Ms = np.arange(M_min, min(M_max, len(e)) + 1)
+    raw = np.array([e[m - 2] / max(e[m - 1], 1e-12) for m in Ms])
+    eligible = np.array([e[m - 2] >= min_eigval for m in Ms])
+    if not eligible.any():
+        eligible = np.ones_like(raw, dtype=bool)   # floor too high; ignore it
+    scored = np.where(eligible, raw, -np.inf)
+    bi = int(np.argmax(scored))
+    best = int(Ms[bi])
+    top = np.sort(raw[eligible])[::-1]
+    if warn and len(top) >= 2 and top[0] < 1.10 * top[1]:
+        _warnings.warn(
+            f'select_M_spectral_gap: ambiguous M -- the top two gap ratios '
+            f'({top[0]:.3f}, {top[1]:.3f}) are within 10%. Inspect the '
+            f'eigenvalue ladder and consider raising min_eigval.',
+            stacklevel=2)
+    return best, float(raw[bi]), np.where(eligible, raw, np.nan)
 
 
 def run_gpcca(T, M, eta=None, method='brandts', z='LM'):
@@ -184,18 +208,25 @@ def compute_hub_arms(phi, pi, chi, threshold=0.5, fallback_threshold=0.3):
 def lump_to_basin_msm(state_seq, chi, lag, smoothing=1.0):
     """Build the basin-level Markov model from cluster sequence and chi.
 
-    Lumps a (T,) integer state sequence into the basin sequence using
-    argmax_j chi[i, j] for each cluster i, then estimates the row-stochastic
-    M x M transition matrix at the requested lag with Laplace smoothing.
+    Lumps integer cluster states into basins via argmax_j chi[i, j], then
+    estimates the row-stochastic M x M transition matrix at the requested lag
+    with Laplace smoothing.  `state_seq` may be a single sequence or a list of
+    per-individual sequences; in the list case transitions are counted within
+    each sequence only (never across the splice between individuals).
 
     Returns (T_basin, pi_basin, basin_assignments).
     """
-    state_seq = np.asarray(state_seq, dtype=int)
+    if isinstance(state_seq, (list, tuple)):
+        seqs = [np.asarray(s, dtype=int) for s in state_seq]
+    else:
+        seqs = [np.asarray(state_seq, dtype=int)]
     M = chi.shape[1]
     basin_assign = chi.argmax(axis=1)
-    basin_seq = basin_assign[state_seq]
     counts = np.zeros((M, M))
-    np.add.at(counts, (basin_seq[:-lag], basin_seq[lag:]), 1.0)
+    for s in seqs:
+        bs = basin_assign[s]
+        if bs.size > lag:
+            np.add.at(counts, (bs[:-lag], bs[lag:]), 1.0)
     counts += smoothing
     T_basin = counts / counts.sum(axis=1, keepdims=True)
     vals, vecs = np.linalg.eig(T_basin.T)

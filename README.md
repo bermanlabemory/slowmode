@@ -28,7 +28,8 @@ For every system, the pipeline runs:
 1. **Wavelet decomposition** (Morlet, $\omega_0 = 5$) of each measurement
    channel into 25 dyadically spaced frequency bands.
 2. **PCA** on the wavelet amplitudes, keeping the components that exceed a
-   phase-shuffle threshold.
+   temporal-shuffle threshold (each feature permuted in time; not a phase
+   randomization).
 3. **Delay embedding** at dimension $d$, chosen by Cao's $E_1(d)$
    saturation criterion.
 4. **K-means partition** into $N$ clusters, with $N$ chosen by the entropy
@@ -42,13 +43,23 @@ For every system, the pipeline runs:
 8. **Hub-and-arm geometry** in the leading non-trivial eigenvectors:
    $\pi$-weighted hub + per-basin arm vectors as centroid$-$hub.
 
+To check a candidate representation on your own data, `diagnostics.run_diagnostics`
+evaluates the paper's four falsifiable criteria (spectral gap, participation
+ratio, simplex/arms geometry, and held-out prediction beating a memoryless
+null) and prints a pass/fail table; `diagnostics.stationarity_drift` flags
+violations of the single-stationary-distribution assumption. When pooling
+multiple recordings, pass a **list** of per-individual cluster sequences to
+`pipeline.make_transition_matrix` so transitions are never counted across the
+splice between individuals.
+
 ## Repository layout
 
 ```
 slowmode/
 ├── pipeline.py             # core algorithms (wavelets, PCA, embed, kmeans, T)
 ├── gpcca_utils.py          # G-PCCA wrapper, hub/arm geometry
-├── figures.py              # shared matplotlib styling, ARM_PALETTE
+├── diagnostics.py          # the four falsifiable criteria + run_diagnostics()
+├── figures.py              # shared matplotlib styling, ARM_PALETTE, plot_psd
 ├── lorenz_simulation.py    # standalone driven-Lorenz simulator
 ├── requirements.txt
 │

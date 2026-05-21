@@ -84,8 +84,8 @@ for j in range(4):
 
 # ---- Eigenvalue spectrum (panel C) ----
 from pipeline import make_transition_matrix
-all_states = np.concatenate(fly_states)
-TM = make_transition_matrix(all_states, lag=int(z_pcca['tau']))
+# Pass the list of per-fly sequences (boundary-safe: no cross-fly transitions).
+TM = make_transition_matrix(fly_states, lag=int(z_pcca['tau']))
 TM = TM / np.maximum(TM.sum(axis=1, keepdims=True), 1e-12)
 evals_full = np.linalg.eigvals(TM)
 evals = np.sort(np.abs(evals_full))[::-1]
