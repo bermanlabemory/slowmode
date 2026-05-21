@@ -18,3 +18,7 @@ env/
 .vscode/
 .idea/
 *.swp
+
+# Generated figure outputs (regenerate with figures/run_all.py)
+*.png
+*.pdf

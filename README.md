@@ -2,8 +2,8 @@
 
 This directory contains the supplementary code accompanying
 
-> Kaur, Jain, & Berman, *Extracting long-timescale structure from
-> non-stationary biological dynamics (2026).
+> Kaur, Jain, & Berman, *Using timescale as a state coordinate reveals the
+> metastable geometry of behavior* (2026).
 
 The repository has two layers:
 
@@ -105,20 +105,20 @@ in Illustrator from these per-panel outputs).
 | Fig. 2C | `figures/figure_2C.py` | $|\lambda_k(\tau)|$ multi vs fixed at $\beta=0.5$ |
 | Fig. 2D | `figures/figure_2D.py` | $h(t)$, multi $\phi_2$, fixed $\phi_2$ time series |
 | Fig. 2E | `figures/figure_2E.py` | Pearson $|r(\phi_2, h)|$ vs mean dwell time, multi vs fixed, $\beta$ sweep |
-| Fig. 3 | `figures/figure_3.py` | Worms (panels A–F) |
-| Fig. 4 | `figures/figure_4.py` | Flies, methodology (panels A–D) |
+| Fig. 3 | `figures/figure_3.py` | Worms (panels A–E) |
+| Fig. 4 | `figures/figure_4.py` | Flies, methodology (panels A–E) |
 | Fig. 5 | `figures/figure_5.py` | Flies, biology (panels A–D) |
-| S1 | `figures/supp_figure_1.py` | Cao $E_1$ fixed + multi; mean dwell vs $\beta$; entropy gap vs $N$ |
+| S1 | `figures/supp_figure_1.py` | Lorenz: Cao $E_1$ fixed + multi; mean dwell vs $\beta$; entropy gap vs $N$ |
 | S2 | `figures/supp_figure_2.py` | Worm operator diagnostics |
-| S3 | `figures/supp_figure_3.py` | Per-worm individuality, M=3 hierarchy, LOO-CV |
+| S3 | `figures/supp_figure_3.py` | Worm biological correspondence + leave-one-worm-out CV |
 | S4 | `figures/supp_figure_4.py` | 12-worm grid of dwell-time CCDFs |
-| S5 | `figures/supp_figure_5.py` | Pooled CCDFs, Vuong R, slow-mode shape (worms) |
-| S6 | `figures/supp_figure_6.py` | Fly operator diagnostics |
-| S7 | `figures/supp_figure_7.py` | Per-fly reproducibility + occupancy stacks |
-| S8 | `figures/supp_figure_8.py` | Per-fly Costa CCDFs + scatter + window sweep |
-| S9 | `figures/supp_figure_9.py` | Spectral definition of $\sigma_\mathrm{slow}$ |
-| S10 | `figures/supp_figure_10.py` | Pooled CCDFs, Vuong R, slow-mode shape (flies) |
-| S11 | `figures/supp_figure_11.py` | Worm Costa-style $V(\phi_2, t)$ landscape |
+| S5 | `figures/supp_figure_5.py` | Worm residence-time model selection + slow-mode shape |
+| S6 | `figures/supp_figure_6.py` | Worm time-evolving landscape $V(\phi_2, t)$ |
+| S7 | `figures/supp_figure_7.py` | Fly parameter selection + basin-count justification |
+| S8 | `figures/supp_figure_8.py` | Fly residence-time model selection + slow-mode shape |
+| S9 | `figures/supp_figure_9.py` | Fly reproducibility / individuality |
+| S10 | `figures/supp_figure_10.py` | One-step-Markov surrogate dwell null (flies + worms) |
+| S11 | `figures/supp_figure_11.py` | Residence-time robustness to smoothing scale $\Delta$ |
 
 ## Quick start: regenerate all paper figures
 
@@ -158,7 +158,7 @@ Each notebook starts with a cell that, when uncommented, will
 
 ```python
 # !pip install pygpcca powerlaw umap-learn
-# !git clone https://github.com/<your-org>/slowmode.git
+# !git clone https://github.com/bermanlabemory/slowmode.git
 # %cd slowmode
 ```
 
@@ -168,7 +168,10 @@ top-to-bottom.
 ## Data shipped in the repository
 
 We ship enough precomputed input data in `data/` for every figure script to
-run end-to-end.  Total size: ~125 MB.
+run end-to-end.  Total size: ~125 MB.  The dwell-time figures (Fig. 5D and
+Supp. Figs. S5, S8, S10, S11) recompute metastable residences on the fly from
+the shipped cluster sequences (via `pipeline.metastable_residences`), so they
+depend only on `states_*.pkl` and the G-PCCA memberships.
 
 | File | Size | What |
 |------|------|------|
@@ -187,11 +190,8 @@ run end-to-end.  Total size: ~125 MB.
 | `worms_umap_canonical_full.npz` | 15 MB | 2D UMAP grid for Fig 3 C/D, S3 A/B |
 | `arm_dynamics_worms_tau3s.npz` | 25 KB | Basin-level MI and apparent decay rate |
 | `worms_supp_data.npz` | 7 KB | Cao $E_1$, entropy gap, eigenvalue ladders |
-| `per_worm_pcca_refit_tau3s.npz` | 4 KB | Per-worm G-PCCA refit cosines and $\alpha$ |
 | `M_eq_1_vs_M_eq_2_test.npz` | 10 KB | Leave-one-worm-out held-out MI vs null |
-| `lognormal_pooled_dwells_worms.npz` | 17 KB | Pooled dwell arrays per basin |
-| `lognormal_reanalysis_worms.npz` | 89 KB | Per-worm $\sigma_\mathrm{slow}$, $\sigma_{\log\tau}$ |
-| `per_worm_truncpl_fits.npz` | 3 KB | Per-worm truncated-PL Vuong R |
+| `lognormal_reanalysis_worms.npz` | 89 KB | Slow-mode (GED) shape for S5C |
 | **Flies (`data/flies/`, 88 MB)** |||
 | `states_flies.pkl` | 43 MB | Multi-timescale cluster sequences at $N = 1000$ |
 | `states_flies_fixed.pkl` | 43 MB | Fixed-timescale cluster sequences at $N = 3000$ |
@@ -202,13 +202,9 @@ run end-to-end.  Total size: ~125 MB.
 | `pr_leave_one_out.npz` | 3 KB | Leave-one-fly-out PR contrast (Fig 4D) |
 | `cv_flies_tau2s.npz` | 9 KB | Leave-one-fly-out CV of basin count |
 | `per_fly_pcca_refit_tau2s.npz` | 10 KB | Per-fly G-PCCA refit cosines |
-| `costa_W_sweep_tau2s.npz` | 18 KB | $r$ vs $W$ sweep for S8 |
-| `lognormal_pooled_dwells.npz` | 862 KB | Pooled dwell arrays per arm |
-| `lognormal_reanalysis.npz` | 878 KB | Per-fly $\sigma_\mathrm{slow}$, $\sigma_{\log\tau}$, GED shape |
-| `per_fly_truncpl_fits.npz` | 7 KB | Per-fly truncated-PL Vuong R |
-| `fly_pooled_fits.pkl` | 970 KB | Pooled PL/LN/trunc-PL fit parameters per arm |
+| `lognormal_reanalysis.npz` | 878 KB | Slow-mode (GED) shape for S8C |
 | `flies_supp_method_data.npz` | 8 KB | PCA shuffle, Cao $E_1$, $\Delta h(N)$ |
-| `flies_supp_method_v2_data.npz` | 3 KB | Updated S6 panel data |
+| `flies_supp_method_v2_data.npz` | 3 KB | S7 $\tau$/$M$ sweeps + basin-count CV |
 
 **Files not shipped (regenerable from raw recordings):**
 
@@ -257,10 +253,9 @@ If this code is useful in your work, please cite the manuscript:
 
 ```bibtex
 @article{KaurJainBerman2026,
-  title   = {Extracting long-timescale structure from non-stationary
-             biological dynamics},
-  author  = {Kaur, P. and Jain, K. and Berman, G. J.},
-  journal = {arXiv},
+  title   = {Using timescale as a state coordinate reveals the metastable
+             geometry of behavior},
+  author  = {Kaur, R. and Jain, K. and Berman, G. J.},
   year    = {2026},
 }
 ```

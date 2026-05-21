@@ -1,8 +1,8 @@
 """Multi-timescale transfer-operator pipeline.
 
 The functions in this module implement the analysis pipeline described in
-Kaur, Jain, and Berman, "Extracting long-timescale structure from
-non-stationary biological dynamics" (PRX Life, 2026):
+Kaur, Jain, & Berman, "Using timescale as a state coordinate reveals the
+metastable geometry of behavior" (2026):
 
     raw signal -> wavelet amplitudes -> PCA -> delay embedding ->
     k-means clustering -> transition matrix T(tau) -> eigendecomposition.
@@ -483,3 +483,70 @@ def multi_timescale_pipeline(x, fs, fmin, fmax, n_freqs, n_pcs=None,
         pi = stationary_distribution(T)
         out.update(T=T, eigvals=evals, eigvecs=evecs, pi=pi)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Metastable residence times (Methods Sec. "Dwell-time distributions").
+# Smooth the per-frame soft membership chi[states] with a Delta-second moving
+# average, assign each frame to its dominant basin (argmax), and take the
+# durations of maximal same-basin runs.  This single definition is used for
+# every dwell-time figure (main Fig. 5D; Supp. Figs. S4, S5, S8, S10, S11),
+# so they are mutually consistent.
+# ---------------------------------------------------------------------------
+def residences_per_individual(states, chi, framerate, delta=2.0):
+    """Per-individual metastable residence times, in seconds.
+
+    Parameters
+    ----------
+    states : list of (T_i,) int arrays
+        Per-individual cluster-index sequences (one per worm/fly).
+    chi : (N_clusters, M) ndarray
+        Soft basin memberships from G-PCCA.
+    framerate : float
+        Sampling rate in Hz.
+    delta : float
+        Membership smoothing window in seconds (boxcar moving average).
+        delta = 0 uses the raw per-frame argmax (sub-second flicker); the
+        manuscript working value is 2 s.
+
+    Returns
+    -------
+    list (len = n_individuals) of lists (len = M) of float arrays
+        residences[i][b] = basin-b residence durations (s) for individual i.
+    """
+    from scipy.ndimage import uniform_filter1d
+    chi = np.asarray(chi)
+    M = chi.shape[1]
+    w = max(1, int(round(delta * framerate)))
+    per_indiv = []
+    for s in states:
+        s = np.asarray(s, dtype=int)
+        m = chi[s]
+        if delta > 0:
+            m = uniform_filter1d(m, size=w, axis=0, mode='nearest')
+        lab = np.argmax(m, axis=1)
+        runs = [[] for _ in range(M)]
+        cur = int(lab[0]); n = 1
+        for a in lab[1:]:
+            if a == cur:
+                n += 1
+            else:
+                runs[cur].append(n); cur = int(a); n = 1
+        runs[cur].append(n)
+        per_indiv.append([np.asarray(r, float) / framerate for r in runs])
+    return per_indiv
+
+
+def metastable_residences(states, chi, framerate, delta=2.0):
+    """Per-basin metastable residence times (seconds), pooled over individuals.
+
+    Thin wrapper over `residences_per_individual` that concatenates each
+    basin's residences across individuals.  Returns a list of M float arrays.
+    """
+    M = np.asarray(chi).shape[1]
+    per_indiv = residences_per_individual(states, chi, framerate, delta=delta)
+    pooled = []
+    for b in range(M):
+        parts = [pi[b] for pi in per_indiv if len(pi[b])]
+        pooled.append(np.concatenate(parts) if parts else np.array([], float))
+    return pooled

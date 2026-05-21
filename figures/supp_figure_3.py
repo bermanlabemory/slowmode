@@ -1,19 +1,14 @@
-"""Worm supplemental figure 2: biological correspondence and individual
-variability.  7 panels in a 2x4 grid.
+"""Supp. Fig. S3 (worms): biological correspondence and individual variability.
 
-Layout:
-  Row 1 (kinematic UMAP overlays + slow-eigenvector geometry):
-    A. UMAP coloured by phase velocity omega
-    B. UMAP coloured by curvature magnitude |theta|
-    C. Arms-and-hub G-PCCA M=2 scatter (phi_2, phi_3)
-    D. M=3 G-PCCA basin centroids on the Costa (omega, |theta|) plane
-       (deeper hierarchy: pirouette stays intact; run splits in two)
-  Row 2 (per-individual analyses):
-    E. Per-worm dwell exponent distributions per basin
-    F. Per-worm Costa heavy-tail test (moved from main figure;
-       null in worms but cleanly negative in flies, see Fig 5D)
-    G. Leave-one-worm-out CV: held-out basin MI vs random 2-coloring null
-    (last cell intentionally blank)
+Five panels:
+  Row 1:  A. UMAP coloured by phase velocity omega
+          B. UMAP coloured by curvature magnitude |theta|
+  Row 2:  C. Arms-and-hub G-PCCA M=2 scatter (phi_2, phi_3)
+          D. M=3 G-PCCA basin centroids on the (omega, |theta|) plane
+             (deeper hierarchy: pirouette stays intact; run splits in two)
+  Row 3:  E. Leave-one-worm-out CV: held-out basin MI vs random 2-coloring null
+
+Companion to Kaur, Jain, & Berman (2026).
 """
 import os, sys
 import numpy as np
@@ -21,7 +16,6 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from matplotlib.transforms import ScaledTranslation
-from scipy.stats import pearsonr
 
 
 from _paths import *  # setup() + ARM_PALETTE + *_DATA + save
@@ -34,7 +28,6 @@ gp  = np.load(os.path.join(OUT, 'gpcca_worms_M2_tau3s.npz'))
 um  = np.load(os.path.join(OUT, 'worms_umap_canonical_full.npz'))
 cv  = np.load(os.path.join(OUT, 'worms_costa_per_cluster.npz'))
 m34 = np.load(os.path.join(OUT, 'gpcca_worms_M3_M4_tau3s.npz'))
-pf  = np.load(os.path.join(OUT, 'per_worm_pcca_refit_tau3s.npz'))
 mt  = np.load(os.path.join(OUT, 'M_eq_1_vs_M_eq_2_test.npz'))
 
 chi_M2  = gp['chi'];     pi_w   = gp['pi']
@@ -49,13 +42,8 @@ pm        = eigs_full['phi_mt'][:, :3]
 gx = um['x_edges']; gy = um['y_edges']
 omega_field = um['omega_field']; theta_field = um['theta_field']
 
-per_worm_alpha = pf['per_worm_alpha']
-per_worm_sigma = pf['per_worm_sigma']
-costa_r = float(pf['costa_r']); costa_p = float(pf['costa_p'])
-
 mi_obs_loo  = mt['heldout_mi_obs']
 mi_null_loo = mt['heldout_mi_null']
-zs = mt['heldout_z']
 
 # ==========================================================
 fig = plt.figure(figsize=(11.0, 11.5))
@@ -127,7 +115,7 @@ axC.set_aspect('equal', adjustable='datalim')
 axC.text(0, 1, 'C', transform=_letter_trans(axC), fontsize=14,
          fontweight='bold', ha='left', va='bottom')
 
-# ---- D: M=3 hierarchy on Costa plane ----
+# ---- D: M=3 hierarchy on (omega, |theta|) plane ----
 axD = fig.add_subplot(gs[1, 3:6])
 hard_M3 = chi_M3.argmax(axis=1)
 ok = np.isfinite(om_mean) & np.isfinite(gp_mean)
@@ -164,73 +152,24 @@ leg_D.get_frame().set_linewidth(0.8)
 axD.text(0, 1, 'D', transform=_letter_trans(axD), fontsize=14,
          fontweight='bold', ha='left', va='bottom')
 
-# ---- E: per-worm dwell-exponent distributions ----
-axE = fig.add_subplot(gs[2, 0:2])
-for j in range(2):
-    a = per_worm_alpha[:, j]
-    a = a[np.isfinite(a)]
-    if len(a) > 0:
-        rng = np.random.default_rng(j)
-        axE.scatter(np.full(len(a), j) + rng.uniform(-0.08, 0.08, len(a)),
-                    a, color=ARM_PALETTE[j], s=44, alpha=0.85,
-                    edgecolor='0.3', linewidth=0.4)
-        axE.hlines(np.median(a), j - 0.18, j + 0.18,
-                   color='0.15', lw=2.0, zorder=5)
-axE.axhline(2.0, color='0.4', lw=0.8, ls='--')
-axE.set_xticks([0, 1])
-axE.set_xticklabels(['Basin 1\n(Pirouette)', 'Basin 2\n(Run)'])
-axE.set_ylabel(r'per-worm dwell exponent ($\alpha$)',
-               fontsize=10, fontweight='bold')
-axE.tick_params(labelsize=7)
-axE.text(0, 1, 'E', transform=_letter_trans(axE), fontsize=14,
-         fontweight='bold', ha='left', va='bottom')
-
-# ---- F: per-worm Costa heavy-tail test (was main panel H in v4) ----
-axF = fig.add_subplot(gs[2, 2:4])
-mask_valid = np.isfinite(per_worm_sigma) & np.isfinite(per_worm_alpha)
-for j in range(2):
-    s = per_worm_sigma[:, j]; a = per_worm_alpha[:, j]
-    ok_j = np.isfinite(s) & np.isfinite(a)
-    axF.scatter(s[ok_j], a[ok_j], color=ARM_PALETTE[j], s=44,
-                alpha=0.85, edgecolor='0.3', linewidth=0.4,
-                label=f'Basin {j+1}')
-s_all = per_worm_sigma[mask_valid]; a_all = per_worm_alpha[mask_valid]
-if mask_valid.sum() >= 4:
-    rr, pp = pearsonr(s_all, a_all)
-    if np.isfinite(rr):
-        slope, intercept = np.polyfit(s_all, a_all, 1)
-        s_line = np.linspace(s_all.min(), s_all.max(), 100)
-        axF.plot(s_line, slope*s_line + intercept, '0.4', lw=0.8, ls='--')
-axF.set_xlabel(r'within-worm slow-mode std ($\sigma_{\mathrm{slow}}$)',
-               fontsize=10, fontweight='bold')
-axF.set_ylabel(r'per-worm dwell exponent ($\alpha$)',
-               fontsize=10, fontweight='bold')
-axF.tick_params(labelsize=7)
-leg_F = axF.legend(prop={'size': 9, 'weight': 'bold'}, frameon=True,
-                   loc='center right', bbox_to_anchor=(0.98, 0.65),
-                   facecolor='white', edgecolor='0.3', framealpha=1.0)
-leg_F.get_frame().set_linewidth(0.8)
-axF.text(0, 1, 'F', transform=_letter_trans(axF), fontsize=14,
-         fontweight='bold', ha='left', va='bottom')
-
-# ---- G: LOO-CV held-out basin MI vs random 2-coloring null ----
-axG = fig.add_subplot(gs[2, 4:6])
+# ---- E: LOO-CV held-out basin MI vs random 2-coloring null ----
+axE = fig.add_subplot(gs[2, 1:5])
 xs = np.arange(len(mi_obs_loo))
-axG.scatter(xs, mi_obs_loo, color=ARM_PALETTE[0], s=46, alpha=0.9,
+axE.scatter(xs, mi_obs_loo, color=ARM_PALETTE[0], s=46, alpha=0.9,
             edgecolor='0.3', linewidth=0.4, label='Held-out')
-axG.scatter(xs, mi_null_loo, color='0.55', s=22, alpha=0.85,
+axE.scatter(xs, mi_null_loo, color='0.55', s=22, alpha=0.85,
             marker='s', edgecolor='0.3', linewidth=0.3, label='Random')
-axG.set_xticks(xs); axG.set_xticklabels([str(i+1) for i in xs], fontsize=7)
-axG.set_xlabel('held-out worm index', fontsize=10, fontweight='bold')
-axG.set_ylabel(r'$I(\mathrm{Basin}_t;\,\mathrm{Basin}_{t+\tau})$  (bits)',
+axE.set_xticks(xs); axE.set_xticklabels([str(i+1) for i in xs], fontsize=7)
+axE.set_xlabel('held-out worm index', fontsize=10, fontweight='bold')
+axE.set_ylabel(r'$I(\mathrm{Basin}_t;\,\mathrm{Basin}_{t+\tau})$  (bits)',
                fontsize=10, fontweight='bold')
-axG.set_yscale('log')
-axG.tick_params(labelsize=7)
-leg_G = axG.legend(prop={'size': 8, 'weight': 'bold'}, frameon=True,
+axE.set_yscale('log')
+axE.tick_params(labelsize=7)
+leg_E = axE.legend(prop={'size': 8, 'weight': 'bold'}, frameon=True,
                    loc='center right', bbox_to_anchor=(0.98, 0.5),
                    facecolor='white', edgecolor='0.3', framealpha=1.0)
-leg_G.get_frame().set_linewidth(0.8)
-axG.text(0, 1, 'G', transform=_letter_trans(axG), fontsize=14,
+leg_E.get_frame().set_linewidth(0.8)
+axE.text(0, 1, 'E', transform=_letter_trans(axE), fontsize=14,
          fontweight='bold', ha='left', va='bottom')
 
 

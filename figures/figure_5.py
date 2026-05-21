@@ -1,19 +1,24 @@
-"""Fig 5 with panel D replaced by sigma_logtau (Costa directional test, log-normal version).
+"""Fig 5 (fly biology) — slow modes recover coarse-grained states and reveal
+long-timescale organization.
 
-Same as build_fig5_tau2s.py except the per-fly Costa scatter now uses
-sigma_logtau = std(log(dwells per fly per arm)) instead of the power-law
-exponent alpha.  This statistic does not require fitting a power law and
-is far more sensitive to slow-mode modulation: pooled r flips from -0.22
-(alpha) to +0.65 (sigma_logtau).
+  A: chi-weighted behavior-map enrichment per arm (Berman 2014 map)
+  B: apparent decay rate r_k(tau) vs lag (non-Markovian slowdown)
+  C: predictive mutual information I(Arm(t); Arm(t+tau)), data vs Markov
+  D: pooled per-arm dwell-time CCDFs with truncated-power-law fits
+
+Companion to Kaur, Jain, & Berman (2026).
 """
-import os, sys
+import os, sys, pickle, warnings
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-from scipy.stats import pearsonr
+from matplotlib.lines import Line2D
+warnings.filterwarnings('ignore')
+import powerlaw
 
 
 from _paths import *  # setup() + ARM_PALETTE + *_DATA + save
+from pipeline import metastable_residences
 ARM_LABELS = [f'arm {j+1}' for j in range(4)]
 
 OUT = FLIES_DATA  # data location
@@ -31,7 +36,6 @@ ARM_TITLES = [
 # ---- Load caches ----
 dyn = np.load(os.path.join(OUT, 'arm_dynamics_results_tau2s.npz'),
               allow_pickle=True)
-ln = np.load(os.path.join(OUT, 'lognormal_reanalysis.npz'), allow_pickle=True)
 bdn_path = os.path.join(OUT, 'behavior_density_chi_tau2s.npz')
 have_density = os.path.exists(bdn_path)
 if have_density:
@@ -42,8 +46,14 @@ apparent_r = dyn['apparent_r_hz']
 mi_emp     = dyn['mi_emp']
 mi_markov  = dyn['mi_markov']
 
-per_fly_sigma  = ln['sigma_slow']        # (30, 4)
-per_fly_logtau = ln['std_logtau']        # (30, 4)
+# Metastable residences for panel D, computed live from states + memberships
+# with Delta=2 s smoothing (pipeline.metastable_residences; Methods Sec.
+# "Dwell-time distributions").
+with open(os.path.join(OUT, 'states_flies.pkl'), 'rb') as f:
+    _sd = pickle.load(f)
+fly_states = [_sd[i].astype(int) for i in sorted(_sd)]
+chi_fly = np.load(os.path.join(OUT, 'gpcca_flies_M4_tau2s.npz'))['chi']
+fly_dwells = metastable_residences(fly_states, chi_fly, framerate=fr, delta=2.0)
 
 # ---- Build figure ----
 fig = plt.figure(figsize=(11.5, 8.0))
@@ -105,38 +115,40 @@ leg_C.get_frame().set_linewidth(0.8)
 axC.text(-0.18, 1.04, 'C', transform=axC.transAxes,
          fontsize=15, fontweight='bold', ha='left', va='bottom')
 
-# Panel D: per-fly Costa test, sigma_logtau version
+# Panel D: pooled per-arm dwell-time CCDFs with truncated-power-law fits
 axD = fig.add_subplot(gs[1, 2])
-per_arm_stats = []
+D_handles = []
 for j in range(M):
-    s = per_fly_sigma[:, j]; y = per_fly_logtau[:, j]
-    ok = np.isfinite(s) & np.isfinite(y)
-    axD.scatter(s[ok], y[ok], c=ARM_PALETTE[j], s=22, alpha=0.8,
-                edgecolors='none', zorder=3)
-    if ok.sum() >= 3:
-        m_j, b_j = np.polyfit(s[ok], y[ok], 1)
-        r_j, p_j = pearsonr(s[ok], y[ok])
-        xs_j = np.linspace(s[ok].min(), s[ok].max(), 50)
-        axD.plot(xs_j, m_j * xs_j + b_j, color=ARM_PALETTE[j],
-                 lw=1.6, alpha=0.95, zorder=4)
-        per_arm_stats.append((j, r_j, p_j))
-axD.set_xlabel(r'slow-mode fluctuation strength ($\sigma_{\mathrm{slow}}$)',
+    d_arm = np.sort(fly_dwells[j])
+    ccdf = 1.0 - np.arange(len(d_arm)) / len(d_arm)
+    axD.loglog(d_arm[:-1], ccdf[:-1], color=ARM_PALETTE[j], lw=1.6, alpha=0.95)
+    fit = powerlaw.Fit(d_arm, discrete=False, verbose=False)
+    xmin = fit.power_law.xmin
+    alpha_j = fit.truncated_power_law.alpha
+    lam_j = fit.truncated_power_law.parameter2
+    idx_xmin = np.searchsorted(d_arm, xmin)
+    if idx_xmin < len(d_arm):
+        ccdf_at_xmin = 1.0 - idx_xmin / len(d_arm)
+        tau_fit = np.logspace(np.log10(xmin), np.log10(d_arm.max() * 1.2), 80)
+        f_tp = tau_fit ** (-alpha_j) * np.exp(-lam_j * tau_fit)
+        cdf_tp = np.cumsum(f_tp[:-1] * np.diff(tau_fit))
+        if cdf_tp[-1] > 0:
+            cdf_tp = cdf_tp / cdf_tp[-1]
+            ccdf_tp = ccdf_at_xmin * (1.0 - cdf_tp)
+            axD.loglog(tau_fit[:-1], ccdf_tp, color=ARM_PALETTE[j], lw=1.0,
+                       ls='--', alpha=0.9)
+    D_handles.append(Line2D([0], [0], color=ARM_PALETTE[j], lw=1.8,
+                            label=fr'{ARM_LABELS_CAP[j]} ($\alpha={alpha_j:.1f}$)'))
+D_handles.append(Line2D([0], [0], color='0.4', lw=1.0, ls='--',
+                        label='truncated power-law'))
+axD.set_xlabel(r'metastable dwell time $\tau$ (s)',
                fontsize=11, fontweight='bold')
-axD.set_ylabel(r'dwell-tail width ($\sigma_{\log\tau}$)',
-               fontsize=11, fontweight='bold')
-for j in range(M):
-    axD.scatter([], [], c=ARM_PALETTE[j], s=30, label=ARM_LABELS_CAP[j])
-leg_D = axD.legend(loc='lower right', prop={'size': 9, 'weight': 'bold'},
-                   handlelength=0.6, handletextpad=0.4,
-                   borderpad=0.4, borderaxespad=0.4, labelspacing=0.3,
-                   frameon=True, facecolor='white', edgecolor='0.6',
-                   framealpha=1.0)
-leg_D.get_frame().set_linewidth(0.8)
+axD.set_ylabel(r'CCDF $P(T \geq \tau)$', fontsize=11, fontweight='bold')
+axD.set_ylim(5e-4, 1.3)
+leg_D = axD.legend(handles=D_handles, loc='lower left',
+                   prop={'size': 8, 'weight': 'bold'}, frameon=False,
+                   handlelength=1.2, labelspacing=0.3)
 axD.text(-0.18, 1.04, 'D', transform=axD.transAxes,
          fontsize=15, fontweight='bold', ha='left', va='bottom')
-
-print('Per-arm sigma_logtau Costa stats:')
-for j, r_j, p_j in per_arm_stats:
-    print(f'  arm {j+1}: r = {r_j:+.3f}, p = {p_j:.3g}')
 
 save(plt.gcf(), 'figure_5')

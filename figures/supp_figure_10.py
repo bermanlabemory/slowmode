@@ -1,181 +1,205 @@
-"""Refined lognormal/trunc-PL diagnostic figure (v3).
+"""Supp. Fig. S10: the heavy fly residence-time tails are not an artifact of
+the membership smoothing.
 
-Updates v2 to incorporate truncated-PL as the primary alternative
-functional form (better fit than LN at the pooled level). Four panels:
+We hold the per-cluster soft membership chi and the Delta=2 s smoothing+argmax
+residence pipeline FIXED, and replace only the temporal cluster sequence with a
+first-order (one-step) Markov chain fit to the lag-1 cluster transitions of the
+data. A first-order chain has no memory beyond one frame; exit times from a
+metastable set of clusters are asymptotically exponential. Because the surrogate
+passes through the identical chi and the identical Delta=2 s smoother, any tail
+the smoothing could "manufacture" is present in both curves -- so a heavier data
+tail is genuine (super-Markovian) dynamics, and the long cutoff cannot be a
+product of the 2 s smoother.
 
-  A: pooled per-arm CCDFs with PL, LN, and trunc-PL fits overlaid
-  B: side-by-side Vuong R histograms (PL vs LN and PL vs trunc-PL per fly)
-  C: σ_logτ vs σ_slow per fly per arm (same as v2)
-  D: slow-mode shape with GED fit (same as v2)
+  A-D: four fly basins, data vs one-step-Markov surrogate (CCDF)
+  E-F: two worm basins, data vs surrogate
+  G:   tail mass (fraction of residences > 30 s), data vs surrogate, all basins
+
+Companion to Kaur, Jain, & Berman (2026).
 """
-import os, pickle
+import os, sys, pickle
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import gridspec
-from matplotlib.lines import Line2D
-from scipy import stats
-from scipy.special import gamma as gamma_fn
-import powerlaw
-import warnings
-warnings.filterwarnings('ignore')
+from scipy.ndimage import uniform_filter1d
 
-
-ARM_TITLES = [
-    'Arm 1 — Idle & Slow',
-    'Arm 2 — Anterior Movements',
-    'Arm 3 — Posterior & Wing Movements',
-    'Arm 4 — Locomotion',
-]
 
 from _paths import *  # setup() + ARM_PALETTE + *_DATA + save
 
-OUT = FLIES_DATA  # data location
-# Core data
-d = np.load(os.path.join(OUT, 'lognormal_reanalysis.npz'), allow_pickle=True)
-dw = np.load(os.path.join(OUT, 'lognormal_pooled_dwells.npz'))
-M = 4
+DELTA = 2.0
+rng = np.random.default_rng(0)
 
-# Per-fly trunc-PL data
-tp = np.load(os.path.join(OUT, 'per_fly_truncpl_fits.npz'))
+FLY = dict(states=os.path.join(FLIES_DATA, 'states_flies.pkl'),
+           npz=os.path.join(FLIES_DATA, 'gpcca_flies_M4_tau2s.npz'),
+           fr=100, M=4,
+           arms=['Arm 1 (Idle & Slow)', 'Arm 2 (Anterior)',
+                 'Arm 3 (Post. & Wing)', 'Arm 4 (Locomotion)'])
+WORM = dict(states=os.path.join(WORMS_DATA, 'states_worms.pkl'),
+            npz=os.path.join(WORMS_DATA, 'gpcca_worms_M2_tau3s.npz'),
+            fr=16, M=2,
+            arms=['Pirouette', 'Run'])
+WORM_COL = ['#D55E00', '#0072B2']   # pirouette=red, run=blue (match S4/S5)
 
-# Pooled trunc-PL fit params
-with open(os.path.join(OUT, 'fly_pooled_fits.pkl'), 'rb') as f:
-    fly_pool = pickle.load(f)
-pool_results = fly_pool['results']
 
-dwells_arm = {a: dw[f'arm{a}'] for a in range(M)}
-sigma_slow = d['sigma_slow']
-std_logtau = d['std_logtau']
-R_pl_ln = d['R_pl_ln']
-R_pl_tp = tp['per_fly_R_tp']
-ln_mu = d['ln_mu']; ln_sig = d['ln_sig']
-ged_eta = d['ged_eta']
-slow_dev = [d[f'pooled_slow_dev_arm{a}'] for a in range(M)]
+def load_states(path):
+    with open(path, 'rb') as f:
+        sd = pickle.load(f)
+    return [sd[i].astype(int) for i in sorted(sd)]
 
-fig = plt.figure(figsize=(11.5, 9.5))
-gs = gridspec.GridSpec(2, 2, hspace=0.46, wspace=0.32,
-                        left=0.08, right=0.97, top=0.94, bottom=0.07)
 
-# --- A: pooled CCDFs with PL, LN, trunc-PL overlays ---
-axA = fig.add_subplot(gs[0, 0])
-for a in range(M):
-    d_arm = dwells_arm[a]
-    sd = np.sort(d_arm)
-    ccdf = 1 - np.arange(len(sd)) / len(sd)
-    axA.loglog(sd[:-1], ccdf[:-1], color=ARM_PALETTE[a], lw=1.5,
-               alpha=0.95)
+def build_T(seqs, Ncl):
+    """Row-stochastic lag-1 cluster transition matrix, pooled over individuals."""
+    T = np.zeros((Ncl, Ncl))
+    for s in seqs:
+        np.add.at(T, (s[:-1], s[1:]), 1.0)
+    rs = T.sum(1)
+    empty = np.flatnonzero(rs == 0)
+    T[empty, empty] = 1.0                      # self-loop for unseen states
+    T /= T.sum(1, keepdims=True)
+    return T
 
-    # Use pooled fits from fly_pooled_fits.pkl
-    r = pool_results[a]
-    xmin = r['pl_xmin']
-    idx_xmin = np.searchsorted(sd, xmin)
-    if idx_xmin >= len(sd):
-        continue
-    ccdf_at_xmin = 1 - idx_xmin / len(sd)
-    tau_fit = np.logspace(np.log10(xmin), np.log10(sd.max()*1.2), 80)
 
-    # PL fit
-    ccdf_pl = ccdf_at_xmin * (tau_fit / xmin) ** (-(r['pl_alpha'] - 1))
-    axA.loglog(tau_fit, ccdf_pl, color=ARM_PALETTE[a], lw=0.9, ls='--',
-               alpha=0.85)
+def simulate(T, length, start, rng):
+    """Exact run-length simulation of a first-order Markov chain."""
+    Ncl = T.shape[0]
+    pdiag = np.diag(T).copy()
+    off = T.copy()
+    off[np.arange(Ncl), np.arange(Ncl)] = 0.0
+    rowsum = off.sum(1)
+    safe = rowsum > 0
+    offcdf = np.zeros_like(off)
+    offcdf[safe] = np.cumsum(off[safe] / rowsum[safe, None], axis=1)
+    seq = np.empty(length, dtype=np.int32)
+    t = 0
+    state = int(start)
+    while t < length:
+        ps = pdiag[state]
+        if ps >= 1.0 or not safe[state]:
+            seq[t:] = state
+            break
+        dwell = int(rng.geometric(1.0 - ps))   # frames in this state, mean 1/(1-ps)
+        end = min(t + dwell, length)
+        seq[t:end] = state
+        t = end
+        if t >= length:
+            break
+        state = int(np.searchsorted(offcdf[state], rng.random()))
+        if state >= Ncl:
+            state = Ncl - 1
+    return seq
 
-    # LN fit (conditional on t ≥ xmin)
-    ln_sf = stats.norm.sf((np.log(tau_fit) - r['ln_mu']) / r['ln_sigma'])
-    ln_sf_at_xmin = stats.norm.sf((np.log(xmin) - r['ln_mu']) / r['ln_sigma'])
-    if ln_sf_at_xmin > 0:
-        ccdf_ln = ccdf_at_xmin * ln_sf / ln_sf_at_xmin
-        axA.loglog(tau_fit, ccdf_ln, color=ARM_PALETTE[a], lw=0.9, ls=':',
-                   alpha=0.85)
 
-    # Truncated PL fit
-    f_tp = tau_fit**(-r['tp_alpha']) * np.exp(-r['tp_lambda'] * tau_fit)
-    if f_tp.sum() > 0:
-        cdf_tp = np.cumsum(f_tp[:-1] * np.diff(tau_fit))
-        if cdf_tp[-1] > 0:
-            cdf_tp = cdf_tp / cdf_tp[-1]
-            ccdf_tp = ccdf_at_xmin * (1 - cdf_tp)
-            axA.loglog(tau_fit[:-1], ccdf_tp, color=ARM_PALETTE[a], lw=1.6,
-                       alpha=0.95)
+def dwells_from_seq(seq, chi, fr, M):
+    w = max(1, int(DELTA * fr))
+    lab = np.argmax(uniform_filter1d(chi[seq], size=w, axis=0, mode='nearest'),
+                    axis=1)
+    out = [[] for _ in range(M)]
+    cur = lab[0]; n = 1
+    for a in lab[1:]:
+        if a == cur:
+            n += 1
+        else:
+            out[cur].append(n); cur = a; n = 1
+    out[cur].append(n)
+    return [np.array(o, float) / fr for o in out]
 
-axA.set_xlabel(r'dwell time $\tau$ (s)', fontsize=11, fontweight='bold')
-axA.set_ylabel(r'CCDF $P(T \geq \tau)$', fontsize=11, fontweight='bold')
-A_handles = [Line2D([0], [0], color=ARM_PALETTE[a], lw=1.8,
-                    label=ARM_TITLES[a]) for a in range(M)]
-A_handles += [
-    Line2D([0], [0], color='0.4', lw=1.0, ls='--', label='power law'),
-    Line2D([0], [0], color='0.4', lw=1.0, ls=':', label='log-normal'),
-    Line2D([0], [0], color='0.4', lw=1.8, label='truncated power-law'),
-]
-axA.legend(handles=A_handles, loc='lower left',
-           prop={'size': 9, 'weight': 'bold'}, frameon=False)
-axA.set_xlim(0.05, 5e3)
-axA.set_ylim(5e-5, 1.3)
 
-# --- B: Per-fly Vuong R histograms for both alternatives ---
-axB = fig.add_subplot(gs[0, 1])
-all_R_ln = R_pl_ln[~np.isnan(R_pl_ln)]
-all_R_tp = R_pl_tp[~np.isnan(R_pl_tp)]
-bins_R = np.linspace(-15, 5, 30)
-axB.hist(all_R_ln, bins=bins_R, color='#888', alpha=0.7,
-         label='Power Law vs.\nLog Normal', edgecolor='none')
-axB.hist(all_R_tp, bins=bins_R, color='#d55e00', alpha=0.7,
-         label='Power Law vs.\nTruncated Power-Law', edgecolor='none')
-axB.axvline(0, color='k', lw=1.0)
-axB.set_xlabel(r'normalized log-likelihood ratio $R$ (Vuong test)',
-               fontsize=11, fontweight='bold')
-axB.set_ylabel('# of fly-arm pairs', fontsize=11, fontweight='bold')
-axB.legend(loc='upper left', prop={'size': 9, 'weight': 'bold'},
-           frameon=False, labelspacing=0.6)
+def run_species(cfg):
+    seqs = load_states(cfg['states'])
+    chi = np.load(cfg['npz'])['chi']
+    Ncl = chi.shape[0]
+    fr, M = cfg['fr'], cfg['M']
+    T = build_T(seqs, Ncl)
+    pi = np.zeros(Ncl)
+    for s in seqs:
+        np.add.at(pi, s, 1.0)
+    pi /= pi.sum()
+    data = [[] for _ in range(M)]
+    surr = [[] for _ in range(M)]
+    for s in seqs:
+        d = dwells_from_seq(s, chi, fr, M)
+        for a in range(M):
+            data[a].append(d[a])
+        ss = simulate(T, len(s), rng.choice(Ncl, p=pi), rng)
+        sd = dwells_from_seq(ss, chi, fr, M)
+        for a in range(M):
+            surr[a].append(sd[a])
+    data = [np.concatenate(x) for x in data]
+    surr = [np.concatenate(x) for x in surr]
+    return data, surr
 
-# --- C: σ_logτ vs σ_slow scatter (unchanged) ---
-axC = fig.add_subplot(gs[1, 0])
-for a in range(M):
-    x = sigma_slow[:, a]; y = std_logtau[:, a]
-    valid = ~(np.isnan(x) | np.isnan(y))
-    if valid.sum() < 5: continue
-    axC.scatter(x[valid], y[valid], s=22, color=ARM_PALETTE[a], alpha=0.75,
-                edgecolor='none', label=f'Arm {a+1}')
-    slope, intercept = np.polyfit(x[valid], y[valid], 1)
-    xx = np.linspace(x[valid].min(), x[valid].max(), 50)
-    axC.plot(xx, slope*xx + intercept, color=ARM_PALETTE[a], lw=1.2, alpha=0.9)
-axC.set_xlabel(r'$\sigma_{\rm slow}$  (windowed std of $\bar\chi_a$, $W=60$ s)',
-               fontsize=11, fontweight='bold')
-axC.set_ylabel(r'$\sigma_{\log\tau}$  per fly per arm',
-               fontsize=11, fontweight='bold')
-axC.legend(loc='upper left', prop={'size': 10, 'weight': 'bold'},
-           frameon=False)
 
-# --- D: slow-mode shape (unchanged) ---
-axD = fig.add_subplot(gs[1, 1])
-def ged_pdf(x, eta, scale):
-    return eta / (2 * scale * gamma_fn(1./eta)) * np.exp(-(np.abs(x)/scale)**eta)
-for a in range(M):
-    z = slow_dev[a]
-    if len(z) == 0: continue
-    z_std = np.std(z)
-    eta = ged_eta[a]
-    scale = (np.mean(np.abs(z)**eta))**(1./eta)
-    bins = np.linspace(z.mean() - 4*z_std, z.mean() + 4*z_std, 80)
-    axD.hist(z, bins=bins, density=True, alpha=0.4, color=ARM_PALETTE[a],
-             edgecolor='none')
-    xx = np.linspace(bins[0], bins[-1], 300)
-    axD.plot(xx, ged_pdf(xx - z.mean(), eta, scale),
-             color=ARM_PALETTE[a], lw=1.4,
-             label=f'Arm {a+1}: $\\eta={eta:.2f}$')
-xx = np.linspace(-4, 4, 300)
-axD.plot(xx, stats.norm.pdf(xx), color='k', ls=':', lw=1.0, alpha=0.5,
-         label='Gaussian ref. ($\\eta=2$)')
-axD.set_xlabel(r'logit$(\bar\chi_a)$ deviation (within-basin)',
-               fontsize=11, fontweight='bold')
-axD.set_ylabel('density', fontsize=11, fontweight='bold')
-axD.legend(loc='upper right', prop={'size': 10, 'weight': 'bold'},
-           frameon=False)
-axD.set_yscale('log')
-axD.set_ylim(1e-3, None)
+def ccdf(d):
+    ds = np.sort(d)
+    return ds, 1.0 - np.arange(len(ds)) / len(ds)
 
-for ax, letter in [(axA, 'A'), (axB, 'B'), (axC, 'C'), (axD, 'D')]:
-    ax.text(-0.13, 1.05, letter, transform=ax.transAxes, fontsize=14,
-            fontweight='bold', va='top')
 
-save(fig, 'supp_figure_10')
-plt.close(fig)
+def frac_beyond(d, thr):
+    return float(np.mean(np.asarray(d) >= thr))
+
+
+print('Building one-step-Markov surrogate nulls...')
+fly_data, fly_surr = run_species(FLY)
+worm_data, worm_surr = run_species(WORM)
+
+# ---- figure: row 1 = fly CCDFs, row 2 = worm CCDFs (E,F) + tail mass (G) ----
+fig = plt.figure(figsize=(13, 6.4))
+gs = fig.add_gridspec(2, 4, hspace=0.48, wspace=0.34)
+
+def _letter(ax, s):
+    ax.text(-0.22, 1.06, s, transform=ax.transAxes, fontsize=13,
+            fontweight='bold', ha='left', va='bottom')
+
+fly_letters = ['A', 'B', 'C', 'D']
+for a in range(FLY['M']):
+    ax = fig.add_subplot(gs[0, a])
+    xs, ys = ccdf(fly_surr[a]); xd, yd = ccdf(fly_data[a])
+    ax.loglog(xs, ys, color='0.55', ls='--', lw=1.8, label='one-step Markov')
+    ax.loglog(xd, yd, color=ARM_PALETTE[a], lw=2.0, label='data')
+    ax.set_title(FLY['arms'][a], fontsize=9)
+    ax.set_xlabel(r'residence $\tau$ (s)', fontsize=9)
+    if a == 0:
+        ax.set_ylabel(r'$P(T \geq \tau)$  (flies)', fontsize=10, fontweight='bold')
+    ax.legend(fontsize=7.5, loc='lower left', frameon=False)
+    ax.set_ylim(8e-4, 1.3)
+    _letter(ax, fly_letters[a])
+
+worm_letters = ['E', 'F']
+for a in range(WORM['M']):
+    ax = fig.add_subplot(gs[1, a])
+    xs, ys = ccdf(worm_surr[a]); xd, yd = ccdf(worm_data[a])
+    ax.loglog(xs, ys, color='0.55', ls='--', lw=1.8, label='one-step Markov')
+    ax.loglog(xd, yd, color=WORM_COL[a], lw=2.0, label='data')
+    ax.set_title(WORM['arms'][a], fontsize=9)
+    ax.set_xlabel(r'residence $\tau$ (s)', fontsize=9)
+    if a == 0:
+        ax.set_ylabel(r'$P(T \geq \tau)$  (worms)', fontsize=10, fontweight='bold')
+    ax.legend(fontsize=7.5, loc='lower left', frameon=False)
+    ax.set_ylim(8e-4, 1.3)
+    _letter(ax, worm_letters[a])
+
+# ---- G: tail mass (% residences > 30 s), data vs surrogate, all six basins ----
+axG = fig.add_subplot(gs[1, 2:4])
+basins = FLY['arms'] + WORM['arms']
+cols   = [ARM_PALETTE[a] for a in range(FLY['M'])] + WORM_COL
+data_all = fly_data + worm_data
+surr_all = fly_surr + worm_surr
+x = np.arange(len(basins)); bw = 0.38
+data_pct = [100 * frac_beyond(d, 30) for d in data_all]
+surr_pct = [100 * frac_beyond(s, 30) for s in surr_all]
+axG.bar(x - bw/2, data_pct, bw, color=cols, edgecolor='0.2', lw=0.4,
+        label='data')
+axG.bar(x + bw/2, surr_pct, bw, color='0.7', edgecolor='0.2', lw=0.4,
+        label='one-step Markov')
+axG.set_xticks(x)
+axG.set_xticklabels(['Arm 1', 'Arm 2', 'Arm 3', 'Arm 4', 'Pir.', 'Run'],
+                    fontsize=8, rotation=20, ha='right')
+axG.set_ylabel(r'% residences $>$ 30 s', fontsize=10, fontweight='bold')
+axG.legend(fontsize=8, frameon=False, loc='upper right')
+_letter(axG, 'G')
+
+# ---- console summary ----
+print('\n=== tail mass (% residences > 30 s): data vs surrogate ===')
+for b, d, s in zip(basins, data_pct, surr_pct):
+    print(f'  {b:22s} data={d:5.1f}%   surrogate={s:5.1f}%')
+
+save(plt.gcf(), 'supp_figure_10')

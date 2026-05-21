@@ -1,30 +1,33 @@
-"""Fly supp — Costa heavy-tail per-fly test (Fig. S8).
+"""Supp. Fig. S8 (flies): residence-time model selection and slow-mode shape.
 
-Three panels (after dropping old D = mean sigma_slow(W) and old E = example
-scatters at W = 10 / 600 s; D's claim was wrong and E was redundant with C).
+Three panels (fly counterpart of Supp. Fig. S5):
+  A. Pooled per-arm dwell-time CCDFs with power-law, log-normal, and
+     truncated-power-law maximum-likelihood fits overlaid.
+  B. Per-fly-per-arm Vuong normalized log-likelihood ratios R comparing
+     the power law against log-normal and against the truncated power law.
+  C. Empirical slow-mode shape: within-arm logit(chi_a) deviation with a
+     generalized-error-distribution (GED) fit.
 
-  A. Per-fly dwell CCDFs, all four arms, coloured by sigma_slow.
-  B. Per-arm Costa scatter (4 sub-panels), regression line + per-arm r in caption.
-     Disattenuated per-arm correlations now live in B's caption (relocated from
-     old E's caption).
-  C. Pooled & per-arm Pearson r(sigma_slow(W), alpha) vs window W, spanning
-     the full width of row 3 as a banner panel.
+Residences use the canonical Delta=2 s definition
+(pipeline.metastable_residences; Methods Sec. "Dwell-time distributions").
+The dwell-time fits (A, B) are computed live; the slow-mode shape (C) is a
+property of chi and is read from the cached re-analysis.
+
+Companion to Kaur, Jain, & Berman (2026).
 """
-import os, sys, pickle
+import os, sys, pickle, warnings
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
-from matplotlib import cm
-from scipy.stats import pearsonr
-from scipy.special import erf
-import powerlaw as plw
+from matplotlib import gridspec
+from matplotlib.lines import Line2D
+from scipy import stats
+from scipy.special import gamma as gamma_fn
+import powerlaw
+warnings.filterwarnings('ignore')
 
 
 from _paths import *  # setup() + ARM_PALETTE + *_DATA + save
-
-OUT = FLIES_DATA  # data location
-STATES = os.path.join(FLIES_DATA, 'states_flies.pkl')
-fr = 100; M = 4
+from pipeline import metastable_residences, residences_per_individual
 
 ARM_TITLES = [
     'Arm 1 — Idle & Slow',
@@ -33,148 +36,132 @@ ARM_TITLES = [
     'Arm 4 — Locomotion',
 ]
 
-# ---- Caches ----
-refit = np.load(os.path.join(OUT, 'per_fly_pcca_refit_tau2s.npz'))
-per_fly_alpha   = refit['per_fly_alpha']
-per_fly_sigma   = refit['per_fly_sigma']
+OUT = FLIES_DATA  # data location
+fr = 100
+M = 4
+MIN_RES = 30
 
-with open(STATES, 'rb') as f:
-    states_dict = pickle.load(f)
-fly_states = [states_dict[i].astype(int) for i in sorted(states_dict)]
-N_flies = len(fly_states)
+# Slow-mode shape (GED) is a property of chi; read from the cached re-analysis.
+d = np.load(os.path.join(OUT, 'lognormal_reanalysis.npz'), allow_pickle=True)
+ged_eta = d['ged_eta']
+slow_dev = [d[f'pooled_slow_dev_arm{a}'] for a in range(M)]
 
-z_pcca = np.load(os.path.join(OUT, 'gpcca_flies_M4_tau2s.npz'))
-assignments = z_pcca['assignments']
-fly_arm_seq = [assignments[fs] for fs in fly_states]
+# Residences (Delta=2 s) from states + memberships.
+with open(os.path.join(OUT, 'states_flies.pkl'), 'rb') as f:
+    _sd = pickle.load(f)
+fly_states = [_sd[i].astype(int) for i in sorted(_sd)]
+chi = np.load(os.path.join(OUT, 'gpcca_flies_M4_tau2s.npz'))['chi']
+dwells_arm = metastable_residences(fly_states, chi, framerate=fr, delta=2.0)
+per_indiv = residences_per_individual(fly_states, chi, framerate=fr, delta=2.0)
 
-W_sweep = np.load(os.path.join(OUT, 'costa_W_sweep_tau2s.npz'))
-W_grid_s_sw = W_sweep['W_grid_s']
-sigma_W_sw  = W_sweep['sigma_W']
-r_pooled    = W_sweep['r_pooled'];  p_pooled = W_sweep['p_pooled']
-r_arm       = W_sweep['r_arm'];     p_arm    = W_sweep['p_arm']
-mean_sigma  = W_sweep['mean_sigma']
+# Per-fly-per-arm Vuong ratios (fly-arm pairs with >= MIN_RES residences).
+R_pl_ln, R_pl_tp = [], []
+for pid in per_indiv:
+    for a in range(M):
+        dd = pid[a]
+        if len(dd) < MIN_RES:
+            continue
+        fit = powerlaw.Fit(dd, discrete=False, verbose=False)
+        r_ln, _ = fit.distribution_compare('power_law', 'lognormal',
+                                           normalized_ratio=True)
+        r_tp, _ = fit.distribution_compare('power_law', 'truncated_power_law',
+                                           normalized_ratio=True)
+        R_pl_ln.append(r_ln); R_pl_tp.append(r_tp)
+R_pl_ln = np.array(R_pl_ln); R_pl_tp = np.array(R_pl_tp)
 
-# ==================================================================
-fig = plt.figure(figsize=(14.0, 10.0))
-gs = GridSpec(3, 4, figure=fig, wspace=0.45, hspace=0.55,
-              left=0.06, right=0.97, top=0.95, bottom=0.06,
-              height_ratios=[1.0, 1.0, 1.06])
+# Pooled fits per arm.
+pool_fits = []
+for a in range(M):
+    fit = powerlaw.Fit(dwells_arm[a], discrete=False, verbose=False)
+    pool_fits.append(dict(
+        pl_alpha=fit.power_law.alpha, pl_xmin=fit.power_law.xmin,
+        ln_mu=fit.lognormal.mu, ln_sigma=fit.lognormal.sigma,
+        tp_alpha=fit.truncated_power_law.alpha,
+        tp_lambda=fit.truncated_power_law.parameter2))
 
-# ---- A (was D): per-fly dwell CCDFs ----
-def runs(x, val):
-    d = np.diff(np.concatenate([[False], x == val, [False]]).astype(int))
-    starts = np.where(d == 1)[0]; ends = np.where(d == -1)[0]
-    return ends - starts
+fig = plt.figure(figsize=(14.5, 4.6))
+gs = gridspec.GridSpec(1, 3, wspace=0.34,
+                       left=0.06, right=0.97, top=0.90, bottom=0.16)
 
-axA = [fig.add_subplot(gs[0, j]) for j in range(M)]
-for armj in range(M):
-    ax = axA[armj]
-    sigma_values = per_fly_sigma[:, armj]
-    rng = np.ptp(sigma_values)
-    sigma_norm = ((sigma_values - np.nanmin(sigma_values)) / rng) if rng > 0 \
-                 else np.full_like(sigma_values, 0.5)
-    for fi, s in enumerate(fly_arm_seq):
-        rl = runs(s, armj) / fr
-        rl = rl[rl >= 0.5]
-        if len(rl) < 3: continue
-        xs = np.sort(rl); ys = 1 - np.arange(len(xs)) / len(xs)
-        col = cm.magma(0.15 + 0.7 *
-                       (sigma_norm[fi] if np.isfinite(sigma_norm[fi]) else 0.5))
-        ax.loglog(xs, ys, color=col, lw=0.8, alpha=0.6)
-    xref = np.logspace(0, 2.5, 20)
-    ax.loglog(xref, (xref / xref[0]) ** (-1.0), 'k--', lw=0.9,
-              label=r'$\mu=2$ (slope $-1$)')
+# --- A: pooled CCDFs with three fits ---
+axA = fig.add_subplot(gs[0, 0])
+for a in range(M):
+    sd = np.sort(dwells_arm[a])
+    ccdf = 1 - np.arange(len(sd)) / len(sd)
+    axA.loglog(sd[:-1], ccdf[:-1], color=ARM_PALETTE[a], lw=1.5, alpha=0.95)
+    r = pool_fits[a]; xmin = r['pl_xmin']
+    idx_xmin = np.searchsorted(sd, xmin)
+    if idx_xmin >= len(sd): continue
+    c0 = 1 - idx_xmin / len(sd)
+    tau = np.logspace(np.log10(xmin), np.log10(sd.max() * 1.2), 80)
+    axA.loglog(tau, c0 * (tau / xmin) ** (-(r['pl_alpha'] - 1)),
+               color=ARM_PALETTE[a], lw=0.9, ls='--', alpha=0.85)
+    ln_sf = stats.norm.sf((np.log(tau) - r['ln_mu']) / r['ln_sigma'])
+    ln0 = stats.norm.sf((np.log(xmin) - r['ln_mu']) / r['ln_sigma'])
+    if ln0 > 0:
+        axA.loglog(tau, c0 * ln_sf / ln0, color=ARM_PALETTE[a], lw=0.9,
+                   ls=':', alpha=0.85)
+    ftp = tau ** (-r['tp_alpha']) * np.exp(-r['tp_lambda'] * tau)
+    cdf = np.cumsum(ftp[:-1] * np.diff(tau))
+    if cdf[-1] > 0:
+        cdf = cdf / cdf[-1]
+        axA.loglog(tau[:-1], c0 * (1 - cdf), color=ARM_PALETTE[a], lw=1.6,
+                   alpha=0.95)
+axA.set_xlabel(r'dwell time $\tau$ (s)', fontsize=11, fontweight='bold')
+axA.set_ylabel(r'CCDF $P(T \geq \tau)$', fontsize=11, fontweight='bold')
+A_handles = [Line2D([0], [0], color=ARM_PALETTE[a], lw=1.8, label=ARM_TITLES[a])
+             for a in range(M)]
+A_handles += [
+    Line2D([0], [0], color='0.4', lw=1.0, ls='--', label='power law'),
+    Line2D([0], [0], color='0.4', lw=1.0, ls=':', label='log-normal'),
+    Line2D([0], [0], color='0.4', lw=1.8, label='truncated power-law'),
+]
+axA.legend(handles=A_handles, loc='lower left',
+           prop={'size': 8, 'weight': 'bold'}, frameon=False)
+axA.set_xlim(0.05, 5e3); axA.set_ylim(5e-5, 1.3)
 
-    # Per-arm pooled lognormal MLE overlay (gray dashed). Computed on the
-    # pool across all flies for this arm; normalized to the data CCDF at
-    # xmin so the overlay represents the typical bulk shape.
-    pooled = []
-    for s in fly_arm_seq:
-        rl = runs(s, armj) / fr
-        pooled.append(rl[rl >= 0.5])
-    pooled = np.concatenate(pooled)
-    if len(pooled) >= 30:
-        fit = plw.Fit(pooled, discrete=False, verbose=False)
-        xmin = float(fit.power_law.xmin)
-        mu_LN = float(fit.lognormal.mu)
-        sigma_LN = float(fit.lognormal.sigma)
-        R_LN, p_LN = fit.distribution_compare('power_law', 'lognormal',
-                                               normalized_ratio=True)
-        frac_above_xmin = float(np.mean(pooled >= xmin))
-        x_grid = np.logspace(np.log10(xmin), np.log10(pooled.max()), 200)
-        full_ccdf = 0.5 * (1.0 - erf((np.log(x_grid) - mu_LN)
-                                      / (sigma_LN * np.sqrt(2.0))))
-        overlay = full_ccdf * (frac_above_xmin / full_ccdf[0])
-        sig = '' if p_LN >= 0.05 else ('*' if p_LN >= 0.01
-                                       else ('**' if p_LN >= 0.001 else '***'))
-        ax.loglog(x_grid, overlay, color='0.25', ls='--', lw=1.4,
-                  label='Log-Normal Fit')
-
-    ax.set_xlabel('dwell time (s)', fontsize=10, fontweight='bold')
-    ax.set_ylabel(r'$P(\mathrm{dwell} \geq t)$' if armj == 0 else '',
-                  fontsize=10, fontweight='bold')
-    ax.set_title(ARM_TITLES[armj], color=ARM_PALETTE[armj],
-                 fontsize=10, fontweight='bold')
-    ax.legend(prop={'size': 8, 'weight': 'bold'},
-              loc='lower left', frameon=False)
-    ax.tick_params(labelsize=7)
-    if armj == 0:
-        ax.text(-0.36, 1.10, 'A', transform=ax.transAxes,
-                fontsize=15, fontweight='bold', ha='left', va='bottom')
-
-# ---- B (was E): per-arm Costa scatter ----
-axB = [fig.add_subplot(gs[1, j]) for j in range(M)]
-for armj in range(M):
-    ax = axB[armj]
-    s = per_fly_sigma[:, armj]; a = per_fly_alpha[:, armj]
-    ok = np.isfinite(s) & np.isfinite(a)
-    ax.scatter(s[ok], a[ok], c=ARM_PALETTE[armj], s=22, alpha=0.85,
-               edgecolors='none')
-    if ok.sum() >= 4:
-        m_, b_ = np.polyfit(s[ok], a[ok], 1)
-        xs = np.linspace(s[ok].min()*0.9, s[ok].max()*1.1, 60)
-        ax.plot(xs, m_ * xs + b_, color='0.15', lw=1.0)
-    ax.set_xlabel(r'$\sigma_{\mathrm{slow}}$ (W = 60 s)',
-                  fontsize=10, fontweight='bold')
-    ax.set_ylabel(r'$\alpha$' if armj == 0 else '',
-                  fontsize=10, fontweight='bold')
-    ax.set_title(ARM_TITLES[armj], color=ARM_PALETTE[armj],
-                 fontsize=10, fontweight='bold')
-    ax.tick_params(labelsize=7)
-    if armj == 0:
-        ax.text(-0.36, 1.10, 'B', transform=ax.transAxes,
-                fontsize=15, fontweight='bold', ha='left', va='bottom')
-
-# ---- C: pooled + per-arm r(W), banner panel spanning row 3 ----
-axC = fig.add_subplot(gs[2, :])
-for j in range(M):
-    sig_mask = p_arm[:, j] < 0.05
-    axC.semilogx(W_grid_s_sw, r_arm[:, j], 'o-', color=ARM_PALETTE[j],
-                 ms=4, lw=1.2, label=f'Arm {j+1}')
-    if sig_mask.any():
-        axC.scatter(W_grid_s_sw[sig_mask], r_arm[sig_mask, j],
-                    s=80, facecolors='none', edgecolors='black',
-                    linewidths=0.7, zorder=10)
-axC.semilogx(W_grid_s_sw, r_pooled, 'k--s', ms=3.5, lw=1.4, label='Pooled')
-axC.set_xlim(3, W_grid_s_sw.max() * 1.05)
-axC.set_xlabel('window size $W$ (s)', fontsize=11, fontweight='bold')
-axC.set_ylabel(r'Pearson $r(\sigma_{\mathrm{slow}}(W),\,\alpha)$',
+# --- B: Vuong R distributions ---
+axB = fig.add_subplot(gs[0, 1])
+bins_R = np.linspace(-15, 5, 30)
+axB.hist(R_pl_ln, bins=bins_R, color='#888', alpha=0.7,
+         label='Power Law vs.\nLog Normal', edgecolor='none')
+axB.hist(R_pl_tp, bins=bins_R, color='#d55e00', alpha=0.7,
+         label='Power Law vs.\nTruncated Power-Law', edgecolor='none')
+axB.axvline(0, color='k', lw=1.0)
+axB.set_xlabel(r'normalized log-likelihood ratio $R$ (Vuong test)',
                fontsize=11, fontweight='bold')
-leg_C = axC.legend(prop={'size': 10, 'weight': 'bold'}, loc='upper left',
-                   ncol=1, handlelength=1.2, labelspacing=0.3,
-                   frameon=True, facecolor='white', edgecolor='0.3',
-                   framealpha=1.0)
-leg_C.get_frame().set_linewidth(0.8)
-axC.tick_params(labelsize=8)
-axC.text(-0.06, 1.04, 'C', transform=axC.transAxes,
-         fontsize=15, fontweight='bold', ha='left', va='bottom')
+axB.set_ylabel('# of fly-arm pairs', fontsize=11, fontweight='bold')
+axB.legend(loc='upper left', prop={'size': 9, 'weight': 'bold'},
+           frameon=False, labelspacing=0.6)
 
-save(plt.gcf(), 'supp_figure_8')
-# Print stats for the caption
-print('\n--- For caption of panel B (per-arm Costa) ---')
-for j in range(M):
-    s = per_fly_sigma[:, j]; a = per_fly_alpha[:, j]
-    ok = np.isfinite(s) & np.isfinite(a)
-    if ok.sum() >= 4:
-        rr, pp = pearsonr(s[ok], a[ok])
-        print(f'  {ARM_TITLES[j]}: n={ok.sum()}, r={rr:+.2f}, p={pp:.2e}')
+# --- C: slow-mode shape (GED) ---
+axC = fig.add_subplot(gs[0, 2])
+def ged_pdf(x, eta, scale):
+    return eta / (2 * scale * gamma_fn(1./eta)) * np.exp(-(np.abs(x)/scale)**eta)
+for a in range(M):
+    z = slow_dev[a]
+    if len(z) == 0: continue
+    z_std = np.std(z); eta = ged_eta[a]
+    scale = (np.mean(np.abs(z)**eta))**(1./eta)
+    bins = np.linspace(z.mean() - 4*z_std, z.mean() + 4*z_std, 80)
+    axC.hist(z, bins=bins, density=True, alpha=0.4, color=ARM_PALETTE[a],
+             edgecolor='none')
+    xx = np.linspace(bins[0], bins[-1], 300)
+    axC.plot(xx, ged_pdf(xx - z.mean(), eta, scale),
+             color=ARM_PALETTE[a], lw=1.4,
+             label=f'Arm {a+1}: $\\eta={eta:.2f}$')
+xx = np.linspace(-4, 4, 300)
+axC.plot(xx, stats.norm.pdf(xx), color='k', ls=':', lw=1.0, alpha=0.5,
+         label='Gaussian ref. ($\\eta=2$)')
+axC.set_xlabel(r'logit$(\bar\chi_a)$ deviation (within-basin)',
+               fontsize=11, fontweight='bold')
+axC.set_ylabel('density', fontsize=11, fontweight='bold')
+axC.legend(loc='upper right', prop={'size': 9, 'weight': 'bold'}, frameon=False)
+axC.set_yscale('log'); axC.set_ylim(1e-3, None)
+
+for ax, letter in [(axA, 'A'), (axB, 'B'), (axC, 'C')]:
+    ax.text(-0.13, 1.05, letter, transform=ax.transAxes, fontsize=14,
+            fontweight='bold', va='top')
+
+save(fig, 'supp_figure_8')
+plt.close(fig)

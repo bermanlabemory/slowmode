@@ -1,12 +1,15 @@
 """Run every figure script in order.
 
-Generates every panel of the published manuscript (Kaur, Jain, Berman,
-PRX Life 2026) into the repo's ``outputs/`` directory.  Each individual
-script can also be run on its own, e.g.::
+Generates every panel of the manuscript (Kaur, Jain, & Berman, 2026) into
+the repo's ``outputs/`` directory.  Each individual script can also be run
+on its own, e.g.::
 
     python figures/figure_3.py
 
-Estimated total runtime on a 2024 laptop without GPU: ~5--10 minutes.
+The dwell-time figures (Fig. 5, S5, S8, S10, S11) recompute metastable
+residences live from the cluster sequences, so a full run takes a bit
+longer than the rest.  Estimated total runtime on a 2024 laptop without
+GPU: ~10--20 minutes.
 """
 import os
 import subprocess

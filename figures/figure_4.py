@@ -1,23 +1,18 @@
-"""Fig. 4 (method) v3 — fly section, panel A = 3D + PR contrast, panel B = 3D + 2D.
+"""Fig. 4 (method) — fly section: localized vs collective slow-mode geometry.
 
-Editor note (PRX Life pre-review): the v2 panel B is the central geometric
-claim of the paper (arms-and-hub at M=4), but the single 3D Matplotlib
-scatter foreshortens the linear-arm structure and crowds the hub. v3 splits
-panel B into a 3D view on top and a 2D projection onto the (phi_3, phi_4)
-plane below, where the four-arm structure is visually unambiguous.
+Panel B is the central geometric claim (arms-and-hub at M=4); it is shown as
+a 3D view (B) plus a 2D projection onto the (phi_3, phi_4) plane (B'), where
+the four-arm structure is unambiguous. Panel A shows the fixed-timescale
+operator localizing on a handful of clusters. The participation-ratio
+contrast (D, promoted from the fly methodology supplement) makes the
+localized-vs-collective contrast quantitative, with leave-one-fly-out SEM
+error bars rendered as filled circles.
 
-Panel A's localization claim reads fine in 3D alone (three spike points are
-0-dimensional structures), so the corresponding 2D projection that v3
-originally placed below A's 3D was redundant.  In its place we promote
-S6 panel F (participation-ratio comparison of the fixed- vs
-multi-timescale operators) into the main figure, with leave-one-fly-out
-SEM error bars rendered as filled circles.  This makes the localized-vs-
-collective contrast between A and B both geometric (3D scatters) and
-quantitative (PR contrast panel).
+Layout (2 rows x 3 cols):
+  Row 1: A (fixed 3D)      B (multi 3D)       B' (multi 2D projection)
+  Row 2: C (eigenvalues)   D (PR contrast)    E (chi_j(t), one fly)
 
-Layout (2 columns x 2 rows outer):
-  Row 1: A (3D + PR contrast)  |  B (3D + 2D projection)
-  Row 2: C (eigenvalues)       |  D (chi_j(t) for a representative fly)
+Companion to Kaur, Jain, & Berman (2026).
 """
 import os, sys, pickle
 import numpy as np

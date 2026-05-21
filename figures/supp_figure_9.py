@@ -1,30 +1,20 @@
-"""Spectral / operator-derived definition of the slow-mode fluctuation
-strength σ_slow, replacing the windowed-variance proxy used in the main
-analysis.
+"""Supp. Fig. S9 (flies): reproducibility / individuality of the slow modes.
 
-Definition.  At the working lag τ = 2 s with M = 4, the slowest *intra-
-basin* relaxation mode of the multi-timescale operator is the eigenvalue
-just past the spectral gap, |λ_5| ≈ 0.60.  Its implied timescale is
-t_5 = -τ / log|λ_5| ≈ 3.9 s, corresponding to a cutoff frequency
-f_cut = 1/(2π t_5) ≈ 0.041 Hz.  We define
-    σ_slow,jk = √( (2/T_j) Σ_{f ≤ f_cut} |X_k^{(j)}(f)|² )
-where X_k^{(j)}(f) is the FFT of the soft membership χ_k(t) for fly j
-restricted to its recording length T_j, and the sum is taken over
-positive frequencies below f_cut. This quantifies the variance of χ_k(t)
-contributed only by modes slower than the operator's intra-basin
-relaxation rate, which is what the Costa T_s is meant to represent.
+Two panels:
+  A. Per-fly G-PCCA refit arm-direction cosines vs the pooled arms,
+     occupancy-filtered.
+  B. Per-fly arm occupancy, stacked.
 
-Then re-test the per-fly Costa correlation (α vs σ_slow) at the
-spectral definition and compare with the W = 60 s descriptive proxy.
+(A subspace-alignment panel was dropped: at M=4 the chance alignment of two
+random 2D subspaces in 4D ambient space is itself substantial, so the test
+cannot reliably distinguish the observed alignment from a permutation null.)
 
-Output: costa_spectral_sigma_tau2s.npz
-        fig_costa_spectral_sigma.png
+Companion to Kaur, Jain, & Berman (2026).
 """
 import os, sys, pickle
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-from scipy.stats import pearsonr
 
 
 from _paths import *  # setup() + ARM_PALETTE + *_DATA + save
@@ -33,160 +23,76 @@ OUT = FLIES_DATA  # data location
 STATES = os.path.join(FLIES_DATA, 'states_flies.pkl')
 fr = 100; M = 4
 
-ARM_TITLES = [
-    'Arm 1 — Idle & Slow',
-    'Arm 2 — Anterior Movements',
-    'Arm 3 — Posterior & Wing Movements',
-    'Arm 4 — Locomotion',
+# Behavioral names per arm (match Fig 5 panel A).
+BEHAVIOR_LABELS_LEGEND = [
+    'Idle & Slow',
+    'Anterior Movements',
+    'Posterior & Wing Movements',
+    'Locomotion',
 ]
 
-# ---- Determine spectral cutoff from operator ----
-gp = np.load(os.path.join(OUT, 'gpcca_flies_M4_tau2s.npz'))
-eigvals_abs = gp['eigvals']                      # [|λ_2|, |λ_3|, |λ_4|, |λ_5|]
-tau_s = float(gp['tau']) / fr                    # 2.0
-# eigvals[3] is |λ_5| because eigvals starts at |λ_2| (idx 0), so |λ_5| at idx 3
-lam5 = float(eigvals_abs[3])
-t5 = -tau_s / np.log(lam5)                       # implied timescale (s)
-f_cut = 1.0 / (2 * np.pi * t5)                   # cutoff frequency (Hz)
-print(f'M = {M}, |λ_5| = {lam5:.3f}, intra-basin relaxation t_5 = {t5:.2f} s, '
-      f'spectral cutoff f_cut = {f_cut:.4f} Hz')
+# ---- Caches ----
+refit = np.load(os.path.join(OUT, 'per_fly_pcca_refit_tau2s.npz'))
+per_fly_arm_cos = refit['pf_arm_cos']
 
-# ---- Load per-fly chi sequences ----
 with open(STATES, 'rb') as f:
     states_dict = pickle.load(f)
 fly_states = [states_dict[i].astype(int) for i in sorted(states_dict)]
 N_flies = len(fly_states)
-chi = gp['chi']                                  # (N_clusters, M)
-fly_chi = [chi[fs, :].astype(float) for fs in fly_states]
 
+z_pcca = np.load(os.path.join(OUT, 'gpcca_flies_M4_tau2s.npz'))
+assignments = z_pcca['assignments']
+fly_arm_seq = [assignments[fs] for fs in fly_states]
+occ_per_fly = np.zeros((N_flies, M))
+for f, s in enumerate(fly_arm_seq):
+    for k in range(M):
+        occ_per_fly[f, k] = (s == k).mean()
+MIN_OCC = 0.02
+per_fly_cos_filt = np.where(occ_per_fly >= MIN_OCC, per_fly_arm_cos, np.nan)
 
-def sigma_slow_spectral(chi_t, fs, f_cut):
-    """Integrated low-frequency power of χ_k(t) for f ≤ f_cut, returned
-    as a standard-deviation-like number per arm."""
-    n = chi_t.shape[0]
-    if n < 4: return np.full(chi_t.shape[1], np.nan)
-    # Detrend per-arm by subtracting the mean (DC removal)
-    x = chi_t - chi_t.mean(axis=0, keepdims=True)
-    # FFT and one-sided power
-    X = np.fft.rfft(x, axis=0)
-    freqs = np.fft.rfftfreq(n, d=1.0/fs)
-    P = (np.abs(X)**2) / (fs * n)                # PSD normalization
-    # Sum over positive frequencies below f_cut (skip DC at index 0)
-    mask = (freqs > 0) & (freqs <= f_cut)
-    if mask.sum() < 1:
-        return np.full(chi_t.shape[1], np.nan)
-    var_lf = 2.0 * P[mask].sum(axis=0) * (freqs[1] - freqs[0])  # one-sided × df
-    return np.sqrt(np.maximum(var_lf, 0.0))
+# ==================================================================
+fig = plt.figure(figsize=(11.0, 4.0))
+gs  = GridSpec(1, 3, figure=fig, wspace=0.45,
+               left=0.07, right=0.86, top=0.88, bottom=0.18)
 
-
-# ---- Compute σ_slow_spectral per fly per arm ----
-sigma_spec = np.full((N_flies, M), np.nan)
-for f in range(N_flies):
-    sigma_spec[f] = sigma_slow_spectral(fly_chi[f], fr, f_cut)
-
-# ---- Per-fly α from existing cache ----
-refit = np.load(os.path.join(OUT, 'per_fly_pcca_refit_tau2s.npz'))
-per_fly_alpha = refit['per_fly_alpha']
-per_fly_sigma_W60 = refit['per_fly_sigma']        # the W=60s proxy
-
-# ---- Per-arm and pooled Pearson correlations ----
-print('\n=== Spectral σ_slow vs windowed σ_slow (W=60s) ===')
-print(f'{"arm":>4} {"n":>4} {"r_spec":>9} {"p_spec":>10}  {"r_W60":>9} {"p_W60":>10}')
-r_spec_arm = np.zeros(M); p_spec_arm = np.zeros(M)
-r_W60_arm  = np.zeros(M); p_W60_arm  = np.zeros(M)
+# ---- A: per-fly refit cosines ----
+axA = fig.add_subplot(gs[0, 0])
+x_off = np.arange(M); jitter_rng = np.random.RandomState(1)
 for j in range(M):
-    a = per_fly_alpha[:, j]
-    s_sp = sigma_spec[:, j]
-    s_w  = per_fly_sigma_W60[:, j]
-    ok = np.isfinite(a) & np.isfinite(s_sp) & np.isfinite(s_w)
-    if ok.sum() >= 4:
-        r_spec_arm[j], p_spec_arm[j] = pearsonr(s_sp[ok], a[ok])
-        r_W60_arm[j],  p_W60_arm[j]  = pearsonr(s_w[ok], a[ok])
-    else:
-        r_spec_arm[j] = p_spec_arm[j] = r_W60_arm[j] = p_W60_arm[j] = np.nan
-    print(f'{j+1:>4d} {int(ok.sum()):>4d}  {r_spec_arm[j]:>+9.3f}  {p_spec_arm[j]:>10.4f}  '
-          f'{r_W60_arm[j]:>+9.3f}  {p_W60_arm[j]:>10.4f}')
+    c = per_fly_cos_filt[:, j]; c = c[np.isfinite(c)]
+    jitter = jitter_rng.uniform(-0.15, 0.15, len(c))
+    axA.scatter(x_off[j] + jitter, c, c=ARM_PALETTE[j], s=20,
+                alpha=0.75, edgecolors='none')
+    axA.hlines(np.median(c), x_off[j] - 0.3, x_off[j] + 0.3,
+               color='k', lw=1.8, zorder=10)
+axA.axhline(1, color='0.5', lw=0.6, ls=':')
+axA.set_xticks(x_off)
+axA.set_xticklabels(BEHAVIOR_LABELS_LEGEND, fontsize=9, fontweight='bold',
+                    rotation=30, ha='right')
+axA.set_ylabel('cosine sim.\nper-fly arm vs pooled',
+               fontsize=11, fontweight='bold')
+axA.set_ylim(-0.05, 1.05)
+axA.tick_params(labelsize=8)
+axA.text(-0.22, 1.04, 'A', transform=axA.transAxes,
+         fontsize=15, fontweight='bold', ha='left', va='bottom')
 
-# Pooled
-all_a = per_fly_alpha.ravel(); all_s_sp = sigma_spec.ravel()
-all_s_w = per_fly_sigma_W60.ravel()
-ok = np.isfinite(all_a) & np.isfinite(all_s_sp) & np.isfinite(all_s_w)
-r_pool_spec, p_pool_spec = pearsonr(all_s_sp[ok], all_a[ok])
-r_pool_W60,  p_pool_W60  = pearsonr(all_s_w[ok],  all_a[ok])
-print(f'pool {int(ok.sum()):>4d}  {r_pool_spec:>+9.3f}  {p_pool_spec:>10.4f}  '
-      f'{r_pool_W60:>+9.3f}  {p_pool_W60:>10.4f}')
-
-# Cross-definition correlation: do the two σ_slow definitions agree?
-cross_r, cross_p = pearsonr(all_s_sp[ok], all_s_w[ok])
-print(f'\nspectral vs windowed σ_slow agreement: r = {cross_r:+.3f}  '
-      f'(p = {cross_p:.2e})')
-
-# ---- Save ----
-np.savez(os.path.join(OUT, 'costa_spectral_sigma_tau2s.npz'),
-         f_cut=f_cut, t5=t5, lam5=lam5,
-         sigma_spec=sigma_spec, per_fly_alpha=per_fly_alpha,
-         per_fly_sigma_W60=per_fly_sigma_W60,
-         r_spec_arm=r_spec_arm, p_spec_arm=p_spec_arm,
-         r_W60_arm=r_W60_arm,  p_W60_arm=p_W60_arm,
-         r_pool_spec=r_pool_spec, p_pool_spec=p_pool_spec,
-         r_pool_W60=r_pool_W60,  p_pool_W60=p_pool_W60,
-         cross_r=cross_r, cross_p=cross_p)
-
-# ---- Plot: 2x3 layout — top row spectral scatters per arm, bottom: comparisons ----
-fig = plt.figure(figsize=(15, 9))
-gs = GridSpec(2, 4, figure=fig, hspace=0.50, wspace=0.45)
-
-# Top row: per-arm scatter under SPECTRAL σ_slow
+# ---- B: per-fly arm occupancy stacks (spans cols 1-2) ----
+axB = fig.add_subplot(gs[0, 1:])
+order = np.argsort(occ_per_fly[:, 0])
+bottom = np.zeros(N_flies)
 for j in range(M):
-    ax = fig.add_subplot(gs[0, j])
-    a = per_fly_alpha[:, j]; s = sigma_spec[:, j]
-    ok = np.isfinite(a) & np.isfinite(s)
-    ax.scatter(s[ok], a[ok], c=ARM_PALETTE[j], s=22, alpha=0.85,
-               edgecolors='none')
-    if ok.sum() >= 4:
-        m_, b_ = np.polyfit(s[ok], a[ok], 1)
-        xs = np.linspace(s[ok].min()*0.9, s[ok].max()*1.1, 50)
-        ax.plot(xs, m_ * xs + b_, color='0.15', lw=1.0)
-    ax.set_xlabel(r'$\sigma_{\mathrm{slow}}$ (spectral)',
-                  fontsize=10, fontweight='bold')
-    ax.set_ylabel(r'$\alpha$' if j == 0 else '',
-                  fontsize=10, fontweight='bold')
-    ax.set_title(ARM_TITLES[j], color=ARM_PALETTE[j], fontsize=10,
-                 fontweight='bold')
-    ax.tick_params(labelsize=7)
-    if j == 0:
-        ax.text(-0.30, 1.10, 'A', transform=ax.transAxes, fontsize=15,
-                fontweight='bold', ha='left', va='bottom')
-
-# Bottom row: r-comparison bars; cross-definition agreement
-ax = fig.add_subplot(gs[1, 0:2])
-x = np.arange(M); w = 0.38
-ax.bar(x - w/2, r_W60_arm,  width=w, color='0.55', label=r'$\sigma_{\mathrm{slow}}$ (W=60s)')
-ax.bar(x + w/2, r_spec_arm, width=w, color='0.15',
-       label=r'$\sigma_{\mathrm{slow}}$ (spectral, $f \leq$' f' {f_cut:.3f} Hz)')
-ax.axhline(0, color='k', lw=0.6)
-ax.set_xticks(x)
-ax.set_xticklabels([f'Arm {j+1}' for j in range(M)], fontweight='bold')
-ax.set_ylabel(r'Pearson $r(\sigma_{\mathrm{slow}}, \alpha)$',
-              fontsize=11, fontweight='bold')
-ax.legend(prop={'size': 10, 'weight': 'bold'}, loc='lower left')
-ax.text(-0.10, 1.04, 'B', transform=ax.transAxes, fontsize=15,
-        fontweight='bold', ha='left', va='bottom')
-
-# Cross-definition scatter
-ax = fig.add_subplot(gs[1, 2:4])
-for j in range(M):
-    s_sp = sigma_spec[:, j]; s_w = per_fly_sigma_W60[:, j]
-    ok = np.isfinite(s_sp) & np.isfinite(s_w)
-    ax.scatter(s_w[ok], s_sp[ok], c=ARM_PALETTE[j], s=20, alpha=0.85,
-               edgecolors='none', label=ARM_TITLES[j])
-ax.set_xlabel(r'$\sigma_{\mathrm{slow}}$ (W=60s)',
-              fontsize=11, fontweight='bold')
-ax.set_ylabel(r'$\sigma_{\mathrm{slow}}$ (spectral)',
-              fontsize=11, fontweight='bold')
-ax.legend(prop={'size': 9, 'weight': 'bold'}, loc='upper left')
-ax.text(-0.10, 1.04, 'C', transform=ax.transAxes, fontsize=15,
-        fontweight='bold', ha='left', va='bottom')
+    axB.bar(np.arange(N_flies), occ_per_fly[order, j],
+            bottom=bottom, color=ARM_PALETTE[j], edgecolor='none',
+            width=1.0, align='center', label=BEHAVIOR_LABELS_LEGEND[j])
+    bottom += occ_per_fly[order, j]
+axB.set_xlabel('fly (sorted by Idle & Slow occupancy)',
+               fontsize=11, fontweight='bold')
+axB.set_ylabel('arm occupancy fraction', fontsize=11, fontweight='bold')
+axB.set_xlim(-0.5, N_flies - 0.5); axB.set_ylim(0, 1)
+axB.legend(loc='center left', bbox_to_anchor=(1.02, 0.5),
+           prop={'size': 10, 'weight': 'bold'}, handlelength=1.2)
+axB.tick_params(labelsize=8)
+axB.text(-0.10, 1.04, 'B', transform=axB.transAxes,
+         fontsize=15, fontweight='bold', ha='left', va='bottom')
 
 save(plt.gcf(), 'supp_figure_9')
-print('\nSaved fig_costa_spectral_sigma.{png,pdf} and costa_spectral_sigma_tau2s.npz')
