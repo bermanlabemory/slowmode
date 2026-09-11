@@ -72,10 +72,9 @@ def _wavelet_one_channel(x, f, dt, omega0):
     """Per-channel Morlet wavelet amplitudes (frequency x time)."""
     N0 = len(x)
     if N0 % 2 == 1:
+        # Append one zero so the padded length is even; the extra sample is
+        # trimmed off again before returning.
         x = np.concatenate([x, [0.0]])
-        wasodd = True
-    else:
-        wasodd = False
     M = len(x)
     # Symmetric zero-padding to reduce edge effects.
     x_pad = np.concatenate([np.zeros(M // 2), x, np.zeros(M // 2)])
@@ -86,10 +85,7 @@ def _wavelet_one_channel(x, f, dt, omega0):
     xhat = np.fft.fftshift(np.fft.fft(x_pad))
     L = len(f)
     amp = np.zeros((L, M))
-    if wasodd:
-        idx = np.arange(M // 2, M // 2 + M - 2).astype(int)
-    else:
-        idx = np.arange(M // 2, M // 2 + M).astype(int)
+    idx = np.arange(M // 2, M // 2 + M).astype(int)
     norm = (np.pi ** -0.25) * np.exp(0.25 * (omega0
                                              - np.sqrt(omega0 ** 2 + 2)) ** 2)
     for i in range(L):
@@ -97,8 +93,6 @@ def _wavelet_one_channel(x, f, dt, omega0):
         q = np.fft.ifft(m * xhat) * np.sqrt(scales[i])
         q = q[idx]
         amp[i, :] = np.abs(q) * norm / np.sqrt(2 * scales[i])
-    if wasodd:
-        amp = amp[:, :N0]
     return amp[:, :N0]
 
 
