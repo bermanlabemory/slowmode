@@ -14,6 +14,8 @@ References to the manuscript are given in each function's docstring.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
@@ -161,16 +163,166 @@ def pca_with_shuffle_threshold(amplitudes, n_shuffles=10, max_keep=50, seed=0,
 
 
 # ---------------------------------------------------------------------------
+# Exact nearest neighbours, used by Cao's E_1 below.  A k-d tree is fast in a
+# few dimensions but degrades towards single-threaded brute force as the
+# dimension grows (e.g. the 100-800 of 50 PCs x d); there a blocked matrix
+# product (BLAS, multithreaded) is much faster and just as exact.
+# ---------------------------------------------------------------------------
+_KDTREE_MAX_DIM = 16    # method='auto' uses the k-d tree up to this dimension
+
+
+def nearest_neighbours(X, query_idx, method='auto'):
+    """Exact nearest neighbour of selected rows of X among all other rows.
+
+    Parameters
+    ----------
+    X : (n, D) ndarray
+        Points (e.g. delay vectors), one per row.
+    query_idx : (m,) int array
+        Rows of X to find neighbours for.  A query's own row is excluded; an
+        exact duplicate of it elsewhere in X is a valid neighbour at distance 0.
+    method : {'auto', 'blas', 'kdtree'}
+        'kdtree' queries a scipy cKDTree.  'blas' ranks every row by
+        |x_j|^2 - 2 x_q.x_j, one matrix product per block, then re-ranks with
+        exact differences the rare queries whose two best candidates are closer
+        than that formula's rounding error, so the answer is exact, not
+        approximately nearest.  'auto' uses 'kdtree' up to 16 dimensions and
+        'blas' above.  The methods agree except, at most, in which of several
+        exactly equidistant neighbours is returned ('blas' returns the lowest
+        index).  Both use as many threads as BLAS is allowed (OMP_NUM_THREADS,
+        threadpoolctl).
+
+    Returns
+    -------
+    nn : (m,) int ndarray
+        Row index of each query's nearest neighbour.
+    dist : (m,) ndarray
+        Euclidean distance to it.
+    """
+    X = np.asarray(X, dtype=float)
+    if X.ndim == 1:
+        X = X[:, None]
+    query_idx = np.asarray(query_idx, dtype=np.intp)
+    if X.shape[0] < 2:
+        raise ValueError('nearest_neighbours needs at least two points')
+    if method == 'auto':
+        method = 'kdtree' if X.shape[1] <= _KDTREE_MAX_DIM else 'blas'
+    if method == 'kdtree':
+        return _nn_kdtree(X, query_idx)
+    if method == 'blas':
+        return _nn_blas(X, query_idx)
+    raise ValueError(f"method must be 'auto', 'blas' or 'kdtree', not {method!r}")
+
+
+def _n_threads():
+    """Thread budget: the current BLAS thread limit, else the CPU count."""
+    try:
+        from threadpoolctl import threadpool_info
+        n = [i['num_threads'] for i in threadpool_info()
+             if i.get('user_api') == 'blas']
+    except Exception:  # pragma: no cover  (threadpoolctl ships with sklearn)
+        n = []
+    return max(1, min(n)) if n else (os.cpu_count() or 1)
+
+
+def _nn_kdtree(X, query_idx):
+    from scipy.spatial import cKDTree
+    dists, nbrs = cKDTree(X).query(X[query_idx], k=2, workers=_n_threads())
+    # Column 0 is the query itself unless it has an exact duplicate, in which
+    # case the two can come back in either order.
+    col = np.where(nbrs[:, 1] == query_idx, 0, 1)
+    rows = np.arange(len(query_idx))
+    return nbrs[rows, col], dists[rows, col]
+
+
+def _nn_blas(X, query_idx, block_queries=256, block_rows=8192, n_threads=None):
+    X = np.ascontiguousarray(X, dtype=np.float64)
+    n, D = X.shape
+    sq = np.einsum('ij,ij->i', X, X)
+    # One product [-2 x_q, 1] . [x_j, |x_j|^2] = |x_j|^2 - 2 x_q.x_j orders
+    # the rows of X exactly as |x_q - x_j|^2 does (|x_q|^2 is constant).
+    Xa = np.empty((n, D + 1))
+    Xa[:, :D] = X
+    Xa[:, D] = sq
+    # Bound (x2 margin) on the rounding error of those values: candidates
+    # closer than `band` may be mis-ordered, so such queries are re-ranked
+    # with exact differences.
+    eps = np.finfo(np.float64).eps
+    x_max = np.sqrt(sq.max())
+
+    def run(q):
+        m = len(q)
+        rows = np.arange(m)
+        Qa = np.empty((m, D + 1))
+        Qa[:, :D] = -2.0 * X[q]
+        Qa[:, D] = 1.0
+        best = np.full(m, np.inf)       # smallest value so far
+        second = np.full(m, np.inf)     # runner-up, at any other row
+        arg = np.zeros(m, dtype=np.intp)
+        for s in range(0, n, block_rows):
+            G = Qa @ Xa[s:s + block_rows].T
+            own = (q >= s) & (q < s + G.shape[1])
+            G[rows[own], q[own] - s] = np.inf            # exclude self
+            j = np.argmin(G, axis=1)
+            v1 = G[rows, j]
+            G[rows, j] = np.inf
+            v2 = G.min(axis=1)
+            second = np.minimum(np.maximum(best, v1), np.minimum(second, v2))
+            better = v1 < best          # strict: earlier block wins ties
+            arg[better] = j[better] + s
+            best[better] = v1[better]
+        band = 4.0 * (D + 2) * eps * (np.sqrt(sq[q]) + x_max) ** 2
+        for r in np.flatnonzero(second - best <= band):
+            g = Xa @ Qa[r]
+            g[q[r]] = np.inf
+            cand = np.flatnonzero(g <= g.min() + band[r])
+            d2 = ((X[cand] - X[q[r]]) ** 2).sum(axis=1)
+            arg[r] = cand[np.argmin(d2)]
+        return arg
+
+    n_threads = _n_threads() if n_threads is None else n_threads
+    # Smaller query blocks when there are too few to keep every thread busy.
+    block_queries = min(block_queries,
+                        max(32, -(-len(query_idx) // n_threads)))
+    chunks = [query_idx[a:a + block_queries]
+              for a in range(0, len(query_idx), block_queries)]
+    nn = np.concatenate([np.zeros(0, dtype=np.intp)]
+                        + _map_threads(run, chunks, n_threads))
+    dist = np.sqrt(((X[nn] - X[query_idx]) ** 2).sum(axis=1))
+    return nn, dist
+
+
+def _map_threads(fn, items, n_threads):
+    """[fn(x) for x in items] on a thread pool, with BLAS single-threaded
+    inside it so the pool, not BLAS, spreads the work over the cores."""
+    if n_threads > 1 and len(items) > 1:
+        try:
+            from threadpoolctl import threadpool_limits
+        except ImportError:  # pragma: no cover
+            threadpool_limits = None
+        if threadpool_limits is not None:
+            from concurrent.futures import ThreadPoolExecutor
+            with threadpool_limits(limits=1, user_api='blas'), \
+                    ThreadPoolExecutor(max_workers=n_threads) as pool:
+                return list(pool.map(fn, items))
+    return [fn(x) for x in items]
+
+
+# ---------------------------------------------------------------------------
 # Cao's E_1(d) saturation criterion for embedding dimension (Cao 1997).
 # Used to choose d in Sec. "Delay embedding and state space construction".
 # ---------------------------------------------------------------------------
-def cao_e1(X, max_d=20, tau=1, n_samples=20000, seed=0):
+def cao_e1(X, max_d=20, tau=1, n_samples=20000, seed=0, nn='auto'):
     """Cao's E_1(d) statistic for delay embedding.
 
     Parameters
     ----------
-    X : (T, p) ndarray
+    X : (T, p) ndarray, or list of (T_i, p) ndarrays
         Multivariate time series in which to embed (e.g. PCA projections).
+        A list is treated as separate recording segments (e.g. the clean
+        stretches between artifacts): delay vectors are formed within each
+        segment, so none spans a boundary, and neighbours are searched among
+        the vectors of all segments.
     max_d : int
         Largest embedding dimension to try.
     tau : int
@@ -178,53 +330,82 @@ def cao_e1(X, max_d=20, tau=1, n_samples=20000, seed=0):
     n_samples : int
         Random subset size (Cao's statistic depends only on nearest-neighbour
         structure; subsampling keeps cost manageable for long series).
+    nn : {'auto', 'blas', 'kdtree'}
+        Nearest-neighbour search; see `nearest_neighbours`.  All three find
+        the same neighbours.  'kdtree' can be fastest at any dimension for
+        long, densely sampled trajectories whose neighbours are very close
+        (e.g. the Lorenz and worm data); 'blas' is far faster for
+        high-dimensional, noise-like features such as EEG band amplitudes.
 
     Returns
     -------
     E1 : (max_d-1,) ndarray
         E_1(d) for d = 1..max_d-1.  Saturation indicates the embedding
         dimension; first d at which E_1 plateaus is the manuscript's choice.
+        The last entry (d = max_d - 1) is not computed and is left at 0.
     """
-    from scipy.spatial import cKDTree
-    rng = np.random.default_rng(seed)
-    X = np.asarray(X, dtype=float)
-    T, p = X.shape
-    if T > n_samples:
-        idx = rng.choice(T - max_d * tau - 2, size=n_samples, replace=False)
-    else:
-        idx = np.arange(T - max_d * tau - 2)
+    segs = [np.asarray(s, dtype=float)
+            for s in (X if isinstance(X, (list, tuple)) else [X])]
+    segs = [s[:, None] if s.ndim == 1 else s for s in segs]
+    lens = np.array([len(s) for s in segs])
+    seg_start = np.cumsum(lens) - lens
+    X_all = segs[0] if len(segs) == 1 else np.concatenate(segs)
 
-    def embed(d):
-        l = T - (d - 1) * tau
-        E = np.zeros((l, d * p))
-        for k in range(d):
-            E[:, k * p:(k + 1) * p] = X[k * tau:k * tau + l]
-        return E
+    # Query points: the delay vectors starting at t < T_i - max_d*tau - 2 in
+    # each segment, which exist at every d tried.
+    n_query = np.maximum(lens - max_d * tau - 2, 0)
+    n_pop = int(n_query.sum())
+    if n_pop == 0:
+        raise ValueError('cao_e1: no segment is longer than max_d * tau + 2')
+    rng = np.random.default_rng(seed)
+    # The first test is the original condition (so a single series draws the
+    # same subsample as before); the second keeps it from asking for more
+    # points than exist.
+    if lens.sum() > n_samples and n_pop >= n_samples:
+        pick = rng.choice(n_pop, size=n_samples, replace=False)
+    else:
+        pick = np.arange(n_pop)
+    q_seg = np.searchsorted(np.cumsum(n_query), pick, side='right')
+    q_t = pick - (np.cumsum(n_query) - n_query)[q_seg]
 
     E1 = np.zeros(max_d - 1)
     a_prev = None
     for d in range(1, max_d):
-        Ed = embed(d)
-        Edp = embed(d + 1)
-        sub_d = Ed[idx]
-        sub_dp = Edp[idx]
+        Ed, row_start, row_end = _embed_segments(segs, d, tau)
+        q_row = row_start[q_seg] + q_t
         # Nearest neighbour in d-dim (excluding self).
-        tree = cKDTree(Ed)
-        dists, nbrs = tree.query(sub_d, k=2)
-        nn = nbrs[:, 1]; dnn = dists[:, 1]
-        # Map nn to (d+1)-dim space (truncate if out of range).
-        valid = nn < Edp.shape[0]
-        sub_d_v = sub_d[valid]
-        sub_dp_v = sub_dp[valid]
-        nn_v = nn[valid]
-        dnn_v = np.maximum(dnn[valid], 1e-12)
-        # Distance after promoting to d+1-dim.
-        dnp = np.linalg.norm(sub_dp_v - Edp[nn_v], axis=1)
-        a_d = np.mean(dnp / dnn_v)
+        nn_row, dnn = nearest_neighbours(Ed, q_row, method=nn)
+        nn_seg = np.searchsorted(row_end, nn_row, side='right')
+        nn_t = nn_row - row_start[nn_seg]
+        # Keep queries whose neighbour also has a (d+1)-dim vector, i.e. is not
+        # among the last tau vectors of its segment.
+        valid = nn_t < lens[nn_seg] - d * tau
+        # Distance after promoting both to d+1 dims (append x(t + d*tau)).
+        next_q = X_all[seg_start[q_seg[valid]] + q_t[valid] + d * tau]
+        next_n = X_all[seg_start[nn_seg[valid]] + nn_t[valid] + d * tau]
+        dnp = np.linalg.norm(np.hstack([Ed[q_row[valid]], next_q])
+                             - np.hstack([Ed[nn_row[valid]], next_n]), axis=1)
+        a_d = np.mean(dnp / np.maximum(dnn[valid], 1e-12))
         if a_prev is not None:
             E1[d - 2] = a_d / a_prev
         a_prev = a_d
     return E1
+
+
+def _embed_segments(segs, d, tau):
+    """Delay-embed each segment separately (as delay_embed) and stack.
+
+    Returns the stacked vectors and each segment's first and one-past-last
+    row; segments shorter than (d-1)*tau + 1 contribute no rows."""
+    p = segs[0].shape[1]
+    n_rows = np.array([max(len(s) - (d - 1) * tau, 0) for s in segs])
+    row_end = np.cumsum(n_rows)
+    row_start = row_end - n_rows
+    E = np.empty((int(row_end[-1]), d * p))
+    for s, r0, l in zip(segs, row_start, n_rows):
+        for k in range(d):
+            E[r0:r0 + l, k * p:(k + 1) * p] = s[k * tau:k * tau + l]
+    return E, row_start, row_end
 
 
 # ---------------------------------------------------------------------------
@@ -267,55 +448,99 @@ def kmeans_partition(X, N, batch_size=None, n_init=20, seed=None,
 # Entropy-gap criterion for choosing N (Methods Sec. "Choosing the number of
 # clusters").  We compare the per-step Markov entropy of the true sequence to
 # that of a Shannon-shuffled surrogate; the optimal N maximises the gap.
+# All three functions accept either one sequence or a list of per-segment
+# sequences (as make_transition_matrix does), for recordings broken into
+# segments -- transitions are never counted across a segment boundary.
 # ---------------------------------------------------------------------------
-def markov_entropy(states, lag, framerate=1.0):
-    """Shannon entropy rate (nats / time-unit) of the lag-tau Markov model
-    estimated from a single sequence.  (Natural log, matching the entropy-gap
-    figures, which are labelled in nats.)"""
-    T = make_transition_matrix(states, lag)
-    pi = stationary_distribution(T)
-    h = 0.0
-    for i in range(T.shape[0]):
-        for j in range(T.shape[1]):
-            if T[i, j] > 0:
-                h -= pi[i] * T[i, j] * np.log(T[i, j])
-    return h * framerate
+def markov_entropy(states, lag, framerate=1.0, n_states=None):
+    """Shannon entropy rate (nats / time-unit) of the lag-tau Markov model.
+
+    `states` is one integer sequence or a list of per-segment sequences.
+    (Natural log, matching the entropy-gap figures, which are labelled in
+    nats.)  Row i of T is weighted by the empirical occupation of state i --
+    its share of the counted transitions -- rather than by the stationary
+    vector of T, which is ill-conditioned when short segments make the chain
+    nearly reducible.  For one long sequence the two agree to O(lag / T).
+    """
+    seqs, _ = _as_sequences(states)
+    if n_states is None:
+        n_states = _n_states_of(seqs)
+    C = _transition_counts(seqs, lag, n_states)
+    if not C.any():
+        raise ValueError(f'markov_entropy: no transitions at lag {lag}')
+    # -sum_i w_i sum_j T_ij log T_ij with w_i = n_i / n and T_ij = C_ij / n_i
+    # (n_i transitions out of i, n in all) = -sum_ij C_ij log(C_ij / n_i) / n.
+    n_out = np.broadcast_to(C.sum(axis=1, keepdims=True), C.shape)
+    m = C > 0
+    h = -np.sum(C[m] * np.log(C[m] / n_out[m])) / C.sum()
+    return float(h) * framerate
 
 
 def shannon_shuffle(states, seed=None):
     """Shannon shuffle: preserve the empirical pair frequency p(s_{t+1}|s_t)
     on aggregate but break long-range correlations.  Used as an entropy
-    surrogate for choosing N."""
+    surrogate for choosing N.
+
+    `states` may be a list of per-segment sequences.  Successors are then
+    drawn from within-segment pairs only, and one surrogate chain of the total
+    length is cut back into the original segment lengths (returned as a list),
+    so it is scored with exactly the segment structure of the data."""
     rng = np.random.default_rng(seed)
-    states = np.asarray(states, dtype=int)
+    seqs, is_list = _as_sequences(states)
+    lens = np.array([len(s) for s in seqs])
+    states = np.concatenate(seqs)
     L = len(states)
-    vals = np.unique(states)
-    positions = {v: np.setdiff1d(np.where(states == v)[0], L - 1) for v in vals}
+    # Positions with a successor: all but the last of each segment.
+    has_next = np.ones(L, dtype=bool)
+    has_next[(np.cumsum(lens) - 1)[lens > 0]] = False
+    starts = np.flatnonzero(has_next)
+    if len(starts) == 0:
+        raise ValueError('shannon_shuffle: no transitions to resample')
+    # positions[v]: the positions of value v that have a successor, ascending.
+    order = np.argsort(states[starts], kind='stable')
+    vals, first = np.unique(states[starts][order], return_index=True)
+    positions = dict(zip(vals, np.split(starts[order], first[1:])))
+    none = starts[:0]
     out = np.empty(L, dtype=int)
-    out[0] = states[rng.integers(0, L - 1)]
+    out[0] = states[starts[rng.integers(0, len(starts))]]
     for i in range(1, L):
-        nxt_pool = positions[out[i - 1]]
+        nxt_pool = positions.get(out[i - 1], none)
         if len(nxt_pool) == 0:
-            out[i] = states[rng.integers(0, L - 1)]
+            out[i] = states[starts[rng.integers(0, len(starts))]]
         else:
             out[i] = states[rng.choice(nxt_pool) + 1]
+    if is_list:
+        return np.split(out, np.cumsum(lens)[:-1])
     return out
 
 
 def entropy_gap(X_embedded, N_values, lag, framerate=1.0, seed=0,
                 n_init=20, verbose=False):
-    """Compute Delta H(N) = H_shuf(N) - H(N) for each N in N_values, on a
-    single delay-embedded time series.
+    """Compute Delta H(N) = H_shuf(N) - H(N) for each N in N_values.
+
+    `X_embedded` is one delay-embedded time series, or a list of per-segment
+    delay-embedded arrays (embed each segment separately, e.g. with
+    `delay_embed`, so that no delay vector spans a boundary).  K-means runs on
+    the pooled rows; the labels are then split back into segments, and H, the
+    Shannon-shuffled surrogate and H_shuf are all computed within segments.
 
     Returns N_values (ndarray), H (ndarray), H_shuf (ndarray)."""
+    if isinstance(X_embedded, (list, tuple)):
+        cuts = np.cumsum([len(x) for x in X_embedded])[:-1]
+        X_embedded = np.concatenate(X_embedded)
+    else:
+        cuts = None
     rng_seed = seed
     H = np.zeros(len(N_values))
     H_shuf = np.zeros(len(N_values))
     for k, N in enumerate(N_values):
         labels = kmeans_partition(X_embedded, N, n_init=n_init, seed=rng_seed)
-        H[k] = markov_entropy(labels, lag, framerate=framerate)
+        if cuts is not None:
+            labels = np.split(labels, cuts)
+        H[k] = markov_entropy(labels, lag, framerate=framerate, n_states=N)
         labels_shuf = shannon_shuffle(labels, seed=rng_seed)
-        H_shuf[k] = markov_entropy(labels_shuf, lag, framerate=framerate)
+        H_shuf[k] = markov_entropy(labels_shuf, lag, framerate=framerate,
+                                   n_states=N)
         if verbose:
             print(f'  N={N}: H={H[k]:.3f}  H_shuf={H_shuf[k]:.3f}  '
                   f'DeltaH={H_shuf[k] - H[k]:.3f}')
@@ -342,18 +567,10 @@ def make_transition_matrix(states, lag, n_states=None):
     Rows for states that never appear are set to a uniform distribution to
     keep T well-defined (downstream G-PCCA rejects all-zero rows).
     """
-    if isinstance(states, (list, tuple)):
-        seqs = [np.asarray(s, dtype=int) for s in states]
-    else:
-        seqs = [np.asarray(states, dtype=int)]
+    seqs, _ = _as_sequences(states)
     if n_states is None:
-        n_states = int(max(int(s.max()) for s in seqs if s.size)) + 1
-    a = np.arange(n_states + 1)
-    F = np.zeros((n_states, n_states))
-    for s in seqs:
-        if s.size > lag:
-            Fi, _, _ = np.histogram2d(s[:-lag], s[lag:], bins=[a, a])
-            F += Fi
+        n_states = _n_states_of(seqs)
+    F = _transition_counts(seqs, lag, n_states)
     sums = F.sum(axis=1, keepdims=True)
     # Empty rows (state never appears as a "from") get a uniform distribution
     # rather than all zeros, so T remains a valid (row-stochastic) transition
@@ -363,6 +580,32 @@ def make_transition_matrix(states, lag, n_states=None):
     sums[empty, 0] = 1.0
     F[empty] = 1.0 / n_states
     return F / sums
+
+
+def _as_sequences(states):
+    """One integer sequence, or a list/tuple of per-segment sequences, as
+    (list of 1-D int arrays, whether a list of sequences was given).  A plain
+    list of scalars is one sequence."""
+    if (isinstance(states, (list, tuple)) and len(states)
+            and np.ndim(states[0]) > 0):
+        return [np.asarray(s, dtype=int) for s in states], True
+    return [np.asarray(states, dtype=int)], False
+
+
+def _n_states_of(seqs):
+    return int(max(int(s.max()) for s in seqs if s.size)) + 1
+
+
+def _transition_counts(seqs, lag, n_states):
+    """C[i, j] = number of i -> j transitions at `lag`, counted within each
+    sequence only."""
+    a = np.arange(n_states + 1)
+    F = np.zeros((n_states, n_states))
+    for s in seqs:
+        if s.size > lag:
+            Fi, _, _ = np.histogram2d(s[:-lag], s[lag:], bins=[a, a])
+            F += Fi
+    return F
 
 
 def stationary_distribution(T):
@@ -396,6 +639,96 @@ def leading_eigvecs(T, k=10, drop_stationary=True):
         if len(keep_idx) >= k:
             break
     return np.array(keep_v), vecs[:, keep_idx]
+
+
+# ---------------------------------------------------------------------------
+# Implied timescales t_k(tau) = -tau / ln|lambda_k(tau)|, used to choose the
+# working lag (Methods Sec. "Choosing the lag").  With short segments a rare
+# cluster can be entered but never left, or left but never re-entered; T is
+# then reducible and such a cluster contributes an eigenvalue near 1 -- a
+# spurious slow mode (|lambda| ~ 0.999 at lag 1 is a ~1000-frame timescale).
+# The standard remedy is to estimate T on the "active set", the largest
+# strongly connected set of the transition-count graph.
+# ---------------------------------------------------------------------------
+def largest_connected_set(states, lag, n_states=None):
+    """States in the largest strongly connected set of the lag-tau count graph.
+
+    i -> j is an edge when that transition is observed at least once (within
+    a segment, if `states` is a list of per-segment sequences).  Components
+    are ranked by the number of transitions leaving their states.  Returns
+    the sorted state indices.
+    """
+    seqs, _ = _as_sequences(states)
+    if n_states is None:
+        n_states = _n_states_of(seqs)
+    return _largest_connected(_transition_counts(seqs, lag, n_states))
+
+
+def _largest_connected(C):
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+    _, comp = connected_components(csr_matrix(C > 0), directed=True,
+                                   connection='strong')
+    size = np.bincount(comp, weights=C.sum(axis=1))
+    return np.flatnonzero(comp == np.argmax(size))
+
+
+def implied_timescales(states, lags, k=5, n_states=None, framerate=1.0,
+                       active_set=False):
+    """Implied timescales of T(tau) over a range of lags.
+
+    Parameters
+    ----------
+    states : (T,) int array, or list of per-segment int arrays
+        Cluster sequence(s); transitions are counted within segments only.
+    lags : sequence of int
+        Lags tau, in frames.
+    k : int
+        Number of non-trivial eigenvalues (lambda_2 .. lambda_{k+1}).
+    framerate : float
+        Timescales are returned in units of 1 / framerate (default: frames).
+    active_set : bool
+        If True, at each lag restrict T(tau) to the largest strongly connected
+        set of the count graph (`largest_connected_set`), renormalising its
+        rows, before the eigendecomposition.  Recommended for short or
+        fragmented recordings, where otherwise a rare, nearly absorbing
+        cluster gives a spurious |lambda| ~ 1 mode.
+
+    Returns
+    -------
+    timescales : (len(lags), k) ndarray
+        -tau / ln|lambda| / framerate; inf where |lambda| = 1, NaN where T has
+        fewer than k + 1 eigenvalues or there are no transitions at tau.
+    eigvals : (len(lags), k) ndarray
+        |lambda_2| .. |lambda_{k+1}|, in descending order (the leading
+        eigenvalue, 1, is dropped; any further eigenvalue at 1 is kept).
+    n_active : (len(lags),) int ndarray
+        Number of states in T(tau) (n_states unless `active_set`).
+    """
+    seqs, _ = _as_sequences(states)
+    if n_states is None:
+        n_states = _n_states_of(seqs)
+    timescales = np.full((len(lags), k), np.nan)
+    eigvals = np.full((len(lags), k), np.nan)
+    n_active = np.zeros(len(lags), dtype=int)
+    for i, lag in enumerate(lags):
+        C = _transition_counts(seqs, lag, n_states)
+        if not C.any():
+            continue
+        if active_set:
+            keep = _largest_connected(C)
+            C = C[np.ix_(keep, keep)]
+            T = C / C.sum(axis=1, keepdims=True)
+        else:
+            keep = np.arange(n_states)
+            T = make_transition_matrix(seqs, lag, n_states=n_states)
+        a = np.sort(np.abs(np.linalg.eigvals(T)))[::-1][1:k + 1]
+        eigvals[i, :len(a)] = a
+        with np.errstate(divide='ignore'):
+            timescales[i, :len(a)] = np.where(
+                a < 1.0, -lag / np.log(a), np.inf) / framerate
+        n_active[i] = len(keep)
+    return timescales, eigvals, n_active
 
 
 def phi2_correlation_preet(states, h, fs=100.0, savgol_window=150,

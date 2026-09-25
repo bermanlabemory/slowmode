@@ -52,6 +52,16 @@ multiple recordings, pass a **list** of per-individual cluster sequences to
 `pipeline.make_transition_matrix` so transitions are never counted across the
 splice between individuals.
 
+The same list convention covers recordings broken into short segments (e.g.
+clean stretches between artifacts): `cao_e1` takes a list of per-segment
+feature arrays, `entropy_gap` a list of per-segment delay-embedded arrays, and
+`markov_entropy`, `shannon_shuffle` and `implied_timescales` lists of
+per-segment cluster sequences; nothing is computed across a segment boundary.
+For such data, `implied_timescales(..., active_set=True)` estimates $T(\tau)$
+on the largest strongly connected set of states, so that a rare cluster that
+is entered but never left (or vice versa) cannot pose as a slow mode, and
+`gpcca_utils.run_gpcca(..., fallback=True)` retries at $M-1$ if G-PCCA fails.
+
 ## Repository layout
 
 ```
