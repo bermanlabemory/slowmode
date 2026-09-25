@@ -15,12 +15,37 @@ the number of basins").
 """
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 try:
     from pygpcca import GPCCA
 except ImportError:  # pragma: no cover
     GPCCA = None
+
+
+def _patch_pygpcca_warnings():
+    """Work around a pygpcca 1.0.4 bug that turns warnings into NameErrors.
+
+    pygpcca._gpcca imports `warnings` only when `sys.warnoptions` is empty but
+    calls `warnings.warn` unconditionally -- e.g. in `_initialize_rot_matrix`
+    when the start-simplex matrix is ill-conditioned, which a rare,
+    nearly absorbing cluster triggers even at M = 2.  In any process started
+    with -W or PYTHONWARNINGS set -- including every child of a process that
+    imported pygpcca, which sets PYTHONWARNINGS itself -- that case raises
+    NameError instead of warning.  Supplying the module fixes it and leaves
+    versions without the bug untouched.
+    """
+    try:
+        import pygpcca._gpcca as core
+    except ImportError:  # pragma: no cover
+        return
+    if not hasattr(core, 'warnings'):
+        core.warnings = warnings
+
+
+_patch_pygpcca_warnings()
 
 
 def select_M_spectral_gap(eigvals, M_min=2, M_max=8, min_eigval=0.0, warn=True):
@@ -75,7 +100,7 @@ def select_M_spectral_gap(eigvals, M_min=2, M_max=8, min_eigval=0.0, warn=True):
     return best, float(raw[bi]), np.where(eligible, raw, np.nan)
 
 
-def run_gpcca(T, M, eta=None, method='brandts', z='LM'):
+def run_gpcca(T, M, eta=None, method='brandts', z='LM', fallback=False):
     """Run G-PCCA at fixed M on a row-stochastic T.
 
     Parameters
@@ -91,6 +116,10 @@ def run_gpcca(T, M, eta=None, method='brandts', z='LM'):
         used in the manuscript.
     z : str
         Sort criterion for Schur eigenvalues ('LM' for largest magnitude).
+    fallback : bool
+        If True and G-PCCA fails at M (pygpcca raises ValueError, e.g. for a
+        degenerate Schur basis), warn and retry at M - 1, M - 2, ... down to
+        M = 2.  Default False: the error propagates.
 
     Returns
     -------
@@ -101,10 +130,13 @@ def run_gpcca(T, M, eta=None, method='brandts', z='LM'):
         basin_counts : (M,) cluster counts per basin (hard);
         pi_basin : (M,) stationary mass per basin;
         schur_vectors : (N, M) Schur basis;
-        pi : (N,) stationary distribution.
+        pi : (N,) stationary distribution;
+        M : int, number of basins returned (below M_requested only after a
+        fallback); M_requested : int.
     """
     if GPCCA is None:
         raise ImportError('pygpcca is required: `pip install pygpcca`.')
+    _patch_pygpcca_warnings()
     if eta is None:
         from pipeline import stationary_distribution
         eta = stationary_distribution(T)
@@ -112,6 +144,22 @@ def run_gpcca(T, M, eta=None, method='brandts', z='LM'):
     # when a cluster is visited only at the very start of a per-individual
     # sub-sequence and therefore never receives incoming probability mass).
     eta = np.maximum(eta, 1e-12); eta = eta / eta.sum()
+    M_requested = M
+    while True:
+        try:
+            out = _gpcca_fixed_M(T, M, eta, method, z)
+            break
+        except ValueError as exc:
+            if not fallback or M <= 2:
+                raise
+            warnings.warn(f'run_gpcca: G-PCCA failed at M={M} ({exc}); '
+                          f'retrying at M={M - 1}.', stacklevel=2)
+            M -= 1
+    out.update(M=M, M_requested=M_requested)
+    return out
+
+
+def _gpcca_fixed_M(T, M, eta, method, z):
     g = GPCCA(T, eta=eta, z=z, method=method)
     try:
         g.optimize(M)
