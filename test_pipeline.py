@@ -329,16 +329,23 @@ def test_markov_entropy_ignores_rows_without_transitions():
 
 
 # shannon_shuffle(SHUFFLE_SEQ, seed=11) from the manuscript implementation
-# (05083f3).
+# (05083f3), and the same for SHUFFLE_SEQ + [7], which ends in a label seen
+# nowhere else (the chain restarts whenever it reaches it).
 SHUFFLE_SEQ = [2, 3, 0, 3, 1, 2, 2, 1, 3, 0, 1, 1, 2, 1, 0, 0, 0, 0, 0, 3,
                0, 2, 3, 0, 1, 1, 1, 3, 0, 3, 3, 3, 0, 1, 2, 1, 2, 2, 2, 0]
 GOLDEN_SHUFFLE = [2, 2, 2, 3, 0, 3, 3, 0, 0, 1, 0, 1, 1, 2, 3, 1, 3, 0, 1, 1,
                   2, 1, 3, 0, 0, 2, 0, 0, 3, 1, 2, 2, 1, 1, 0, 0, 1, 2, 2, 3]
+GOLDEN_SHUFFLE_SINK = [2, 2, 2, 3, 0, 2, 2, 3, 0, 1, 0, 7, 2, 3, 0, 1, 3, 0,
+                       7, 1, 2, 1, 3, 0, 0, 2, 0, 0, 1, 3, 0, 3, 0, 1, 0, 3,
+                       0, 3, 3, 0, 7]
 
 
 def test_shannon_shuffle_single_sequence_unchanged():
     out = pp.shannon_shuffle(np.array(SHUFFLE_SEQ), seed=11)
     np.testing.assert_array_equal(out, GOLDEN_SHUFFLE)
+    np.testing.assert_array_equal(
+        pp.shannon_shuffle(np.array(SHUFFLE_SEQ + [7]), seed=11),
+        GOLDEN_SHUFFLE_SINK)
     # A plain list of labels is still one sequence ...
     np.testing.assert_array_equal(pp.shannon_shuffle(SHUFFLE_SEQ, seed=11),
                                   GOLDEN_SHUFFLE)
@@ -349,16 +356,43 @@ def test_shannon_shuffle_single_sequence_unchanged():
 
 
 def test_shannon_shuffle_segments_resample_within_segment_pairs_only():
-    segs = [np.array([0, 0, 1, 1, 0]), np.array([2, 2, 3, 3, 2, 2]),
-            np.array([1])]
+    segs = [np.array([0, 0, 1, 1]), np.array([3, 3, 0, 1, 2, 2, 3, 0]),
+            np.array([2, 3])]
     seen = {(a, b) for s in segs for a, b in zip(s[:-1], s[1:])}
     for seed in range(20):
         out = pp.shannon_shuffle(segs, seed=seed)
-        assert [len(o) for o in out] == [5, 6, 1]
+        assert [len(o) for o in out] == [4, 8, 2]
         # Every step of the surrogate chain, even across the cuts, is a pair
-        # seen inside a segment -- never a splice such as 0->2 or 2->1.
+        # seen inside a segment -- never the splices 1->3 or 0->2.
         chain = np.concatenate(out).tolist()
         assert set(zip(chain[:-1], chain[1:])) <= seen
+
+
+def test_shannon_shuffle_is_not_absorbed_by_a_closed_final_cluster():
+    """Cluster 2 occurs only in the final run, so its only observed successor
+    is itself.  The manuscript implementation, once in it, never left (in 15
+    of these 20 seeds, for up to 98% of the surrogate); now its last
+    occurrence restarts the chain, so it stays about as rare as in the data
+    (0.5%)."""
+    s = np.r_[np.tile([0, 1], 500), [2] * 5]
+
+    share = [np.mean(pp.shannon_shuffle(s, seed=seed) == 2)
+             for seed in range(20)]
+
+    assert max(share) < 0.05
+
+
+def test_shannon_shuffle_segments_visit_disjoint_closed_sets():
+    """Segments that live in two disjoint sets of clusters: without restarts
+    at segment-final occurrences the chain would stay in whichever set it
+    started in."""
+    rng = np.random.default_rng(10)
+    segs = [np.where(rng.random(40) < 0.5, *((0, 1) if k % 2 == 0 else (2, 3)))
+            for k in range(10)]
+
+    for seed in range(20):
+        chain = np.concatenate(pp.shannon_shuffle(segs, seed=seed))
+        assert 0.0 < np.mean(chain <= 1) < 1.0
 
 
 def test_entropy_gap_one_segment_list_is_the_array():

@@ -484,7 +484,16 @@ def shannon_shuffle(states, seed=None):
     `states` may be a list of per-segment sequences.  Successors are then
     drawn from within-segment pairs only, and one surrogate chain of the total
     length is cut back into the original segment lengths (returned as a list),
-    so it is scored with exactly the segment structure of the data."""
+    so it is scored with exactly the segment structure of the data.
+
+    A closed set of states -- one the chain can enter but never leave, such
+    as a cluster seen only in the final run of the data, whose only observed
+    successor is itself -- would absorb the surrogate for good.  Unless the
+    only closed set is the bulk of the data, a closed set's segment-final
+    occurrences therefore count as draws that restart the chain (at a random
+    position, as for a state that never has a successor), so the surrogate
+    leaves such a set at the rate the data does.  Other draws are unchanged.
+    """
     rng = np.random.default_rng(seed)
     seqs, is_list = _as_sequences(states)
     lens = np.array([len(s) for s in seqs])
@@ -497,9 +506,12 @@ def shannon_shuffle(states, seed=None):
     if len(starts) == 0:
         raise ValueError('shannon_shuffle: no transitions to resample')
     # positions[v]: the positions of value v that have a successor, ascending.
-    order = np.argsort(states[starts], kind='stable')
-    vals, first = np.unique(states[starts][order], return_index=True)
-    positions = dict(zip(vals, np.split(starts[order], first[1:])))
+    positions = _positions_by_value(states, starts)
+    stuck = _states_in_absorbing_sets(states, starts)
+    if len(stuck):
+        every = _positions_by_value(states, np.arange(L))
+        for v in stuck:
+            positions[v] = every[v]
     none = starts[:0]
     out = np.empty(L, dtype=int)
     out[0] = states[starts[rng.integers(0, len(starts))]]
@@ -508,10 +520,46 @@ def shannon_shuffle(states, seed=None):
         if len(nxt_pool) == 0:
             out[i] = states[starts[rng.integers(0, len(starts))]]
         else:
-            out[i] = states[rng.choice(nxt_pool) + 1]
+            j = rng.choice(nxt_pool)
+            if has_next[j]:
+                out[i] = states[j + 1]
+            else:            # a segment-final occurrence: restart
+                out[i] = states[starts[rng.integers(0, len(starts))]]
     if is_list:
         return np.split(out, np.cumsum(lens)[:-1])
     return out
+
+
+def _positions_by_value(states, idx):
+    """{v: the positions in `idx` (ascending) at which states == v}."""
+    order = np.argsort(states[idx], kind='stable')
+    vals, first = np.unique(states[idx][order], return_index=True)
+    return dict(zip(vals, np.split(idx[order], first[1:])))
+
+
+def _states_in_absorbing_sets(states, starts):
+    """Values in the closed sets of the successor graph (i -> states[i+1] for
+    i in `starts`) that would absorb a Shannon-shuffle chain: every closed
+    set, unless the only one is the largest strongly connected set.  Values
+    that never have a successor are left out; the chain restarts from them
+    anyway."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+    vals, code = np.unique(states, return_inverse=True)
+    src, dst = code[starts], code[starts + 1]
+    graph = csr_matrix((np.ones(len(src)), (src, dst)),
+                       shape=(len(vals), len(vals)))
+    n_comp, comp = connected_components(graph, directed=True,
+                                        connection='strong')
+    c_src, c_dst = comp[src], comp[dst]
+    n_out = np.bincount(c_src, minlength=n_comp)     # transitions out of a set
+    leaks = np.zeros(n_comp, dtype=bool)
+    leaks[c_src[c_src != c_dst]] = True
+    closed = (n_out > 0) & ~leaks
+    main = np.argmax(n_out)
+    if not closed.any() or (closed.sum() == 1 and closed[main]):
+        return vals[:0]
+    return vals[closed[comp]]
 
 
 def entropy_gap(X_embedded, N_values, lag, framerate=1.0, seed=0,
